@@ -55,14 +55,16 @@ import os
 import sys
 
 # ---------------------------------------------------------------------------
-# Imports — all relative to python/ directory
+# Imports — packages live inside vsx_diagnostics_py\ subdirectory
 # ---------------------------------------------------------------------------
-# Allow running from both:
-#   python vsx_diagnostics.py          (from python/ directory)
-#   python python/vsx_diagnostics.py   (from repo root)
-_HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+# vsx_diagnostics.py  lives at: C:\vsx_diagnostics\
+# packages live at:             C:\vsx_diagnostics\vsx_diagnostics_py\
+# We add vsx_diagnostics_py\ to sys.path so bare imports work everywhere.
+_HERE    = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.join(_HERE, "vsx_diagnostics_py")
+for _p in (_HERE, _PKG_DIR):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from collectors.cluster_health import collect_cluster_health
 from collectors.hcp import collect_hcp
