@@ -312,7 +312,8 @@ def _collect_all(session, summary: HealthSummary, args: argparse.Namespace) -> N
         f"OK ({len(summary.hcp.errors)} error(s), {len(summary.hcp.infos)} info(s))"
         if summary.hcp.ran_ok else
         "unavailable" if summary.hcp.not_available else
-        "timed out"
+        "timed out" if summary.hcp.timed_out else
+        "parse failed (check log)"
     )
     print(f" {hcp_status}")
 

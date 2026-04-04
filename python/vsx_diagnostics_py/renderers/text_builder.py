@@ -140,8 +140,8 @@ def build_full_lines(s: HealthSummary) -> List[str]:
     else:
         lines += ["  [ClusterXL not active or not a cluster member — skipped]", ""]
 
-    # HCP
-    if s.hcp.ran_ok:
+    # HCP — write raw output to log regardless of parse success
+    if s.hcp.raw_summary:
         lines += _banner("HCP Health Check Results")
         lines += [s.hcp.raw_summary, ""]
 
