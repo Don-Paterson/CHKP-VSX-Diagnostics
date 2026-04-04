@@ -5,6 +5,7 @@
 $dest     = "C:\vsx_diagnostics"
 $zip      = "$env:TEMP\vsx_diag.zip"
 $extract  = "$env:TEMP\vsx_diag_extract"
+$src      = "$extract\CHKP-VSX-Diagnostics-main\python"
 
 # -----------------------------------------------------------------------
 # Step 1 - Download and extract
@@ -24,18 +25,25 @@ Expand-Archive -Path $zip -DestinationPath $extract -Force
 
 # -----------------------------------------------------------------------
 # Step 2 - Deploy files
+# Preserve hcp_archive (contains downloaded HCP reports - never delete)
+# Update everything else in place using robocopy
 # -----------------------------------------------------------------------
 Write-Host "Step 2: Deploying to $dest..." -ForegroundColor Yellow
 
-if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-Copy-Item "$extract\CHKP-VSX-Diagnostics-main\python" $dest -Recurse
+New-Item -ItemType Directory -Path $dest -Force | Out-Null
 
-# Create output directories
+# robocopy: /E=include subdirs /IS=overwrite same /IT=overwrite tweaked
+# /XD hcp_archive = skip that folder so archived reports survive updates
+# /NFL /NDL /NJH /NJS = suppress file/dir/header/summary output
+robocopy $src $dest /E /IS /IT /XD "$dest\hcp_archive" /NFL /NDL /NJH /NJS | Out-Null
+
+# Ensure output dirs exist
 New-Item -ItemType Directory -Path "$dest\reports"     -Force | Out-Null
 New-Item -ItemType Directory -Path "$dest\hcp_archive" -Force | Out-Null
 
 # Cleanup temp files
-Remove-Item $zip, $extract -Recurse -Force
+Remove-Item $zip     -Force -ErrorAction SilentlyContinue
+Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "        Done." -ForegroundColor Green
 
