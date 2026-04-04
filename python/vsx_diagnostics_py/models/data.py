@@ -281,6 +281,71 @@ class PlatformInfo:
     cpinfo_raw: str = ""            # cpinfo -y all
 
 
+
+# ---------------------------------------------------------------------------
+# HCP (Health Check Point) results
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HCPResult:
+    """One test result row from the hcp -r all summary table."""
+    vsid: int = 0
+    test_name: str = ""
+    status: str = ""            # "PASSED" / "INFO" / "ERROR" / "SKIPPED"
+    runtime_sec: float = 0.0   # from the failed-tests table (when present)
+
+
+@dataclass
+class HCPTestDetail:
+    """
+    Full detail block for one non-PASSED test.
+    Extracted from the pipe-table section of hcp -r all output.
+    """
+    vsid: int = 0
+    test_name: str = ""
+    status: str = ""
+    description: str = ""
+    finding: str = ""           # raw finding text (may include ASCII tables)
+    suggested: str = ""         # suggested solutions text
+
+
+@dataclass
+class HCPCollection:
+    """All HCP data collected from one gateway run."""
+    hostname: str = ""
+    ran_ok: bool = False        # False if hcp timed out or was not available
+    timed_out: bool = False
+    not_available: bool = False # True if hcp binary not found
+    raw_summary: str = ""       # full terminal output of hcp -r all
+    results: List[HCPResult] = field(default_factory=list)
+    details: List[HCPTestDetail] = field(default_factory=list)
+    # Path to the downloaded tar.gz on A-GUI (empty if download failed)
+    local_archive_path: str = ""
+
+    @property
+    def errors(self) -> List[HCPResult]:
+        return [r for r in self.results if r.status == "ERROR"]
+
+    @property
+    def infos(self) -> List[HCPResult]:
+        return [r for r in self.results if r.status == "INFO"]
+
+    @property
+    def skipped(self) -> List[HCPResult]:
+        return [r for r in self.results if r.status == "SKIPPED"]
+
+    @property
+    def passed(self) -> List[HCPResult]:
+        return [r for r in self.results if r.status == "PASSED"]
+
+    def detail_for(self, test_name: str) -> "HCPTestDetail | None":
+        """Look up the detail block for a given test name."""
+        for d in self.details:
+            if d.test_name.strip() == test_name.strip():
+                return d
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Health assessment output
 # ---------------------------------------------------------------------------
@@ -316,6 +381,7 @@ class HealthSummary:
     vsid_diags: Dict[int, VSIDDiag] = field(default_factory=dict)
                                     # keyed by vsid
     cluster_health: ClusterHealth = field(default_factory=ClusterHealth)
+    hcp: HCPCollection = field(default_factory=HCPCollection)
 
     # --- Assessment output ---
     attention_items: List[AttentionItem] = field(default_factory=list)

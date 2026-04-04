@@ -381,6 +381,55 @@ class ExpertSession:
         safe_path = remote_path.replace("'", "'\\''")
         self._exec(f"rm -f '{safe_path}'")
 
+    def download_file(self, remote_path: str, local_path: str) -> bool:
+        """
+        Download a single file from the gateway to local_path via SFTP.
+        Creates local parent directories if they don't exist.
+        Returns True on success, False on any error.
+
+        Used to retrieve hcp report tar.gz files to:
+            C:\\vsx_diagnostics\\hcp_archive\\<hostname>\\<filename>
+        """
+        import os
+        try:
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+            sftp = self._client.open_sftp()
+            try:
+                sftp.get(remote_path, local_path)
+                size = os.path.getsize(local_path)
+                log.info(
+                    "SFTP: downloaded %s -> %s (%.1f KB)",
+                    remote_path, local_path, size / 1024,
+                )
+                return True
+            finally:
+                sftp.close()
+        except Exception as e:
+            log.warning("SFTP download failed: %s -> %s: %s", remote_path, local_path, e)
+            return False
+
+    def list_remote_dir(self, remote_dir: str) -> list:
+        """
+        List files in a remote directory via SFTP.
+        Returns list of (filename, st_mtime) tuples, sorted newest first.
+        Returns empty list on any error.
+        """
+        try:
+            sftp = self._client.open_sftp()
+            try:
+                attrs = sftp.listdir_attr(remote_dir)
+                result = sorted(
+                    [(a.filename, a.st_mtime or 0) for a in attrs],
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+                return result
+            finally:
+                sftp.close()
+        except Exception as e:
+            log.warning("SFTP listdir failed on %s: %s", remote_dir, e)
+            return []
+
     def close(self) -> None:
         """Close the shell channel and SSH connection."""
         try:
