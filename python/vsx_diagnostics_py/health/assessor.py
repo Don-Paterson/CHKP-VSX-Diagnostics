@@ -265,9 +265,14 @@ def _check_hcp(summary: HealthSummary) -> None:
                  "hcp -r all timed out — health check results unavailable")
         return
 
-    for result in hcp.errors:
+    # Gather all non-PASSED, non-SKIPPED results
+    # hcp uses: ERROR, WARNING (note: different from our severity levels), INFO
+    non_passing = [r for r in hcp.results
+                   if r.status not in ("PASSED", "SKIPPED")]
+
+    for result in non_passing:
         # Bond Health on Hyper-V — check if it's lab noise
-        if result.test_name == "Bond Health":
+        if result.test_name == "Bond Health" and result.status == "ERROR":
             detail = hcp.detail_for("Bond Health")
             if detail and _is_hyperv_bond_noise(detail.finding):
                 _add(summary, "INFO", "HCP / Bond Health",
@@ -280,15 +285,16 @@ def _check_hcp(summary: HealthSummary) -> None:
         msg = f"[VS {result.vsid}] {result.test_name}"
         if finding:
             msg += f": {finding}"
-        _add(summary, "WARNING", "HCP", msg)
 
-    for result in hcp.infos:
-        detail = hcp.detail_for(result.test_name)
-        finding = _first_line(detail.finding) if detail else ""
-        msg = f"[VS {result.vsid}] {result.test_name}"
-        if finding:
-            msg += f": {finding}"
-        _add(summary, "INFO", "HCP", msg)
+        # Map hcp status to our severity
+        if result.status == "ERROR":
+            our_severity = "WARNING"
+        elif result.status == "WARNING":
+            our_severity = "WARNING"
+        else:  # INFO
+            our_severity = "INFO"
+
+        _add(summary, our_severity, "HCP", msg)
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +310,26 @@ def _pct_int(pct_str: str) -> int | None:
 
 
 def _first_line(text: str) -> str:
-    """Return first non-empty line of text, stripped."""
+    """
+    Return first meaningful non-table line of text, stripped.
+    Prefers lines that are not inside pipe-delimited ASCII tables.
+    Falls back to first non-empty non-separator line if no prose found.
+    """
+    first_non_empty = ""
     for line in text.splitlines():
         s = line.strip()
-        if s and not set(s) <= set('|-+='):
+        if not s:
+            continue
+        # Skip pure separator lines (+-=| only)
+        if set(s) <= set('|-+= '):
+            continue
+        # Prefer lines that are not pipe-table rows
+        if not (s.startswith('|') and s.endswith('|')):
             return s[:120]
-    return ""
+        # Remember first non-separator line as fallback
+        if not first_non_empty:
+            first_non_empty = s[:120]
+    return first_non_empty
 
 
 def _is_hyperv_bond_noise(finding: str) -> bool:
