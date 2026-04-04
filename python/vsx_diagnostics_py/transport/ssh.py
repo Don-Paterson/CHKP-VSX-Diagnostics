@@ -99,10 +99,11 @@ import paramiko
 log = logging.getLogger(__name__)
 
 # Prompt patterns we watch for on the interactive shell
-_CLISH_PROMPT   = re.compile(r'\S+>\s*$')
-_EXPERT_PROMPT  = re.compile(r'\[Expert@[^\]]+\][#$]\s*$')
+_CLISH_PROMPT    = re.compile(r'\S+>\s*$')
+_EXPERT_PROMPT   = re.compile(r'\[Expert@[^\]]+\][#$]\s*$')
 _PASSWORD_PROMPT = re.compile(r'[Pp]assword:\s*$')
-_GENERIC_PROMPT = re.compile(r'[$#>]\s*$')
+_CUSTOM_PROMPT   = re.compile(r'GAIA_EXPERT#\s*$')
+_GENERIC_PROMPT  = re.compile(r'[$#>]\s*$')
 
 # Sentinel used to delimit command output in the interactive shell
 _SENTINEL = "__VSX_DIAG_DONE__"
@@ -212,9 +213,18 @@ class ExpertSession:
                 f"Unexpected output after 'expert' on {self.connected_ip}: {pw_buf[-300:]!r}"
             )
 
-        # Set a clean PS1 so our sentinel detection is reliable
+        # Set a clean PS1 so our sentinel detection is reliable.
+        # Use a brief sleep to let the shell settle before the first command.
         self._shell.send("export PS1='GAIA_EXPERT# '\n")
-        self._read_until_prompt(timeout=10)
+        time.sleep(1.5)
+        # Drain whatever is in the buffer (PS1 echo + new prompt)
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            if self._shell.recv_ready():
+                self._shell.recv(4096)
+                time.sleep(0.2)
+            else:
+                break
 
         self._shell_open = True
         log.info("Expert shell open on %s (%s)", self.hostname, self.connected_ip)
@@ -230,7 +240,7 @@ class ExpertSession:
         """
         buf = ""
         deadline = time.time() + timeout
-        patterns = [_CLISH_PROMPT, _EXPERT_PROMPT, _PASSWORD_PROMPT]
+        patterns = [_CLISH_PROMPT, _EXPERT_PROMPT, _PASSWORD_PROMPT, _CUSTOM_PROMPT]
         if extra_pattern:
             patterns.append(extra_pattern)
 
@@ -265,7 +275,7 @@ class ExpertSession:
                     # Return only what came before the sentinel
                     before = buf.split(_SENTINEL)[0]
                     # Consume remainder up to next prompt
-                    self._read_until_prompt(timeout=5)
+                    self._read_until_prompt(timeout=8)
                     return before
             else:
                 time.sleep(_SHELL_READ_PAUSE)
@@ -287,10 +297,20 @@ class ExpertSession:
         self._shell.send(f"{cmd}; echo {_SENTINEL}\n")
         output = self._read_until_sentinel(timeout=timeout)
 
-        # Strip the echoed command line (first line) and trailing whitespace
+        # Strip the echoed command line and any prompt lines from output.
+        # The terminal echo may include the full command or a wrapped version.
         lines = output.splitlines()
-        if lines and cmd.strip() in lines[0]:
+        # Remove first line if it contains our command (terminal echo)
+        if lines and (cmd.strip()[:40] in lines[0] or lines[0].strip() == ''):
             lines = lines[1:]
+        # Remove any trailing prompt lines
+        while lines and (
+            _EXPERT_PROMPT.search(lines[-1]) or
+            _CUSTOM_PROMPT.search(lines[-1]) or
+            _CLISH_PROMPT.search(lines[-1]) or
+            lines[-1].strip() == ''
+        ):
+            lines.pop()
         return "\n".join(lines).strip()
 
     # ------------------------------------------------------------------

@@ -6,12 +6,12 @@ to the local A-GUI archive folder, and returns a parsed HCPCollection.
 collect_hcp(session, hostname, archive_root, timeout) -> HCPCollection
 
 Archive folder structure created on A-GUI:
-    <archive_root>\<hostname>\hcp_report_<hostname>_<timestamp>.tar.gz
+    <archive_root>/<hostname>/hcp_report_<hostname>_<timestamp>.tar.gz
 
 e.g.:
-    C:\vsx_diagnostics\hcp_archive\A-VSX-01\hcp_report_A-VSX-01_04_04_26_18_22.tar.gz
+    C:/vsx_diagnostics/hcp_archive/A-VSX-01/hcp_report_A-VSX-01_04_04_26_18_22.tar.gz
 
-The tar.gz is Check Point's own HTML report — extract and open index.html
+The tar.gz is Check Point's own HTML report -- extract and open index.html
 in a browser for the full interactive view.  Our tool parses the terminal
 output for ATTENTION items; the tar.gz is kept for historical reference.
 """
@@ -49,7 +49,7 @@ def collect_hcp(
     session      : active ExpertSession (expert mode, VS0)
     hostname     : gateway hostname (e.g. "A-VSX-01") — used for archive path
     archive_root : local base folder for hcp archives on A-GUI
-                   e.g. r"C:\vsx_diagnostics\hcp_archive"
+                   e.g. r"C:\vsx_diagnosticshcp_archive"
     timeout      : seconds to wait for hcp to complete (default 180)
 
     Returns a populated HCPCollection.  Never raises — all failures
