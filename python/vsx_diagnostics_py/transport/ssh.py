@@ -226,6 +226,8 @@ class ExpertSession:
             else:
                 break
 
+        # Give the shell a moment to fully settle before accepting commands
+        time.sleep(0.5)
         self._shell_open = True
         log.info("Expert shell open on %s (%s)", self.hostname, self.connected_ip)
 
@@ -271,6 +273,7 @@ class ExpertSession:
             if self._shell.recv_ready():
                 chunk = self._shell.recv(8192).decode("utf-8", errors="replace")
                 buf += chunk
+                log.debug("_read_until_sentinel recv: %r", chunk[-100:])
                 if _SENTINEL in buf:
                     # Return only what came before the sentinel
                     before = buf.split(_SENTINEL)[0]
@@ -280,38 +283,31 @@ class ExpertSession:
             else:
                 time.sleep(_SHELL_READ_PAUSE)
 
-        log.warning("_read_until_sentinel timed out; buf tail: %r", buf[-200:])
+        log.warning("_read_until_sentinel timed out after %.0fs; buf tail: %r",
+                    timeout, buf[-300:])
         return buf
 
     def run(self, cmd: str, timeout: float = _COMMAND_TIMEOUT) -> str:
         """
-        Run cmd in the persistent expert shell.
-        Returns stdout+stderr as a single string.
-        Uses a sentinel echo to delimit output reliably.
+        Run cmd in expert-mode bash via a fresh exec_command channel.
+        Returns stdout+stderr combined as a single string.
+
+        Uses exec_command (same as run_in_vs) rather than the interactive
+        shell — more reliable across Gaia versions and avoids PTY quirks.
+        The interactive shell (_open_shell) is kept for expert-mode entry
+        only; all actual commands go through exec_command channels.
+
+        The command is run with CP profiles sourced so $FWDIR etc. are set.
         """
-        if not self._shell_open:
-            self._open_shell()
-
         log.debug("run(): %s", cmd[:120])
-        # Send command followed by sentinel echo
-        self._shell.send(f"{cmd}; echo {_SENTINEL}\n")
-        output = self._read_until_sentinel(timeout=timeout)
-
-        # Strip the echoed command line and any prompt lines from output.
-        # The terminal echo may include the full command or a wrapped version.
-        lines = output.splitlines()
-        # Remove first line if it contains our command (terminal echo)
-        if lines and (cmd.strip()[:40] in lines[0] or lines[0].strip() == ''):
-            lines = lines[1:]
-        # Remove any trailing prompt lines
-        while lines and (
-            _EXPERT_PROMPT.search(lines[-1]) or
-            _CUSTOM_PROMPT.search(lines[-1]) or
-            _CLISH_PROMPT.search(lines[-1]) or
-            lines[-1].strip() == ''
-        ):
-            lines.pop()
-        return "\n".join(lines).strip()
+        out, err, rc = self._exec(cmd, timeout=timeout)
+        if rc != 0 and err.strip() and not out.strip():
+            return err.strip()
+        # Combine stdout and stderr — some CP commands write to stderr
+        combined = out
+        if err.strip() and err.strip() not in combined:
+            combined = combined + ("\n" if combined else "") + err.strip()
+        return combined.strip()
 
     # ------------------------------------------------------------------
     # exec_command-based execution (for vsenv and showncs)
