@@ -24,9 +24,10 @@ from __future__ import annotations
 import html as html_module
 import logging
 import os
-from typing import List
+from typing import List, Optional
 
 from models.data import AttentionItem, HealthSummary
+from models.snapshot import DeltaItem, DeltaReport
 
 log = logging.getLogger(__name__)
 
@@ -47,11 +48,15 @@ _STATE_CLASS = {
 }
 
 
-def render_html(summary: HealthSummary, path: str) -> None:
+def render_html(
+    summary: HealthSummary,
+    path: str,
+    delta: Optional[DeltaReport] = None,
+) -> None:
     """Write the self-contained HTML report to path."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    content = _build_html(summary)
+    content = _build_html(summary, delta)
     with open(path, "w", encoding="utf-8", errors="replace") as f:
         f.write(content)
 
@@ -64,7 +69,7 @@ def render_html(summary: HealthSummary, path: str) -> None:
 # Main builder
 # ---------------------------------------------------------------------------
 
-def _build_html(s: HealthSummary) -> str:
+def _build_html(s: HealthSummary, delta: Optional[DeltaReport] = None) -> str:
     sections: List[str] = []
 
     sections.append(_header_section(s))
@@ -72,6 +77,8 @@ def _build_html(s: HealthSummary) -> str:
     sections.append(_cluster_members_section(s))
     sections.append(_vsid_table_section(s))
     sections.append(_health_section(s))
+    if delta is not None:
+        sections.append(_delta_section(delta))
     sections.append(_attention_section(s))
     sections.append(_virtual_devices_section(s))
     sections.append(_hcp_section(s))
@@ -383,6 +390,211 @@ def e(text: str) -> str:
     return html_module.escape(str(text))
 
 
+def _delta_section(delta: DeltaReport) -> str:
+    """Render the full delta comparison card."""
+    elapsed_str = _fmt_elapsed(delta.elapsed_seconds)
+
+    meta_parts = [
+        f"<span class='delta-meta-item'>Previous run: <strong>{e(delta.prev_run_id)}</strong></span>",
+        f"<span class='delta-meta-item'>Elapsed: <strong>{e(elapsed_str)}</strong></span>",
+    ]
+    if delta.different_members:
+        meta_parts.append(
+            f"<span class='delta-meta-item delta-note'>"
+            f"&#9432; Member changed: {e(delta.prev_member)} &rarr; {e(delta.curr_member)}"
+            f" &mdash; failover counts may differ"
+            f"</span>"
+        )
+    if delta.suppressed:
+        meta_parts.append(
+            "<span class='delta-meta-item delta-note'>"
+            "&#9432; Runs &lt;2 min apart &mdash; threshold flags suppressed"
+            "</span>"
+        )
+    meta_html = "<div class='delta-meta'>" + "".join(meta_parts) + "</div>"
+
+    if not delta.has_changes:
+        body = meta_html + "<p class='delta-nochange'>&#10003; No changes detected since previous run.</p>"
+        return _card("Delta Comparison", body)
+
+    rows: List[str] = []
+
+    # ── Cluster ───────────────────────────────────────────────────────
+    rows += _delta_group_header("Cluster")
+    rows += _delta_item_row("Failover count",    delta.failover_count)
+    rows += _delta_item_row("Sync status",       delta.sync_status)
+    rows += _delta_item_row("Sync lost updates", delta.sync_lost_updates)
+    for member, item in sorted(delta.member_states.items()):
+        rows += _delta_item_row(f"{member} state", item)
+
+    # ── Platform ──────────────────────────────────────────────────────
+    rows += _delta_group_header("Platform")
+    rows += _delta_item_row("CPU idle %",   delta.cpu_idle_pct,  fmt="{:.1f}%")
+    rows += _delta_item_row("Swap used",    delta.swap_used_mb,  fmt="{} MB")
+    rows += _delta_item_row("Root disk %",  delta.disk_root_pct, fmt="{}%")
+    rows += _delta_item_row("Log disk %",   delta.disk_log_pct,  fmt="{}%")
+
+    # ── Connections ────────────────────────────────────────────────────
+    rows += _delta_group_header("Connections")
+    rows += _delta_item_row("Total connections", delta.total_conn_current)
+
+    # ── Per-VSID ──────────────────────────────────────────────────────
+    any_vsid_change = any(vd.has_changes for vd in delta.vsid_deltas.values())
+    if any_vsid_change:
+        rows += _delta_group_header("Per-VSID")
+        for vsid_int, vd in sorted(delta.vsid_deltas.items()):
+            if not vd.has_changes:
+                continue
+            label = f"VSID {vsid_int} ({e(vd.name)})"
+            rows += _delta_item_row(f"{label} &mdash; conn count",  vd.conn_current)
+            rows += _delta_item_row(f"{label} &mdash; conn %",      vd.conn_pct, fmt="{:.1f}%")
+            rows += _delta_item_row(f"{label} &mdash; SecureXL",    vd.securexl_status)
+            for ie in vd.iface_error_deltas:
+                cls = "delta-flagged" if ie.flagged else "delta-changed"
+                flag_icon = " &#9888;" if ie.flagged else ""
+                rows.append(
+                    f"<tr class='{cls}'>"
+                    f"<td class='delta-label'>{label} &mdash; {e(ie.dev)} {e(ie.direction)}</td>"
+                    f"<td class='delta-prev'>{ie.prev_errors} err / {ie.prev_drops} drop</td>"
+                    f"<td class='delta-arrow'>&rarr;</td>"
+                    f"<td class='delta-curr'>{ie.curr_errors} err / {ie.curr_drops} drop</td>"
+                    f"<td class='delta-change'>"
+                    f"+{ie.delta_errors} err, +{ie.delta_drops} drop{flag_icon}"
+                    f"</td>"
+                    f"</tr>"
+                )
+
+    # ── PNOTE changes ─────────────────────────────────────────────────
+    if delta.new_pnotes or delta.resolved_pnotes or delta.changed_pnotes:
+        rows += _delta_group_header("PNOTE Changes")
+        for p in delta.new_pnotes:
+            rows.append(
+                f"<tr class='delta-flagged'>"
+                f"<td class='delta-label'>{e(p.get('name','?'))}</td>"
+                f"<td colspan='3' class='delta-curr'>NEW &mdash; {e(p.get('status','?'))}</td>"
+                f"<td class='delta-change'>&#9888; new issue</td>"
+                f"</tr>"
+            )
+        for p in delta.resolved_pnotes:
+            rows.append(
+                f"<tr class='delta-resolved'>"
+                f"<td class='delta-label'>{e(p.get('name','?'))}</td>"
+                f"<td colspan='3' class='delta-prev'>RESOLVED</td>"
+                f"<td class='delta-change'>&#10003; cleared</td>"
+                f"</tr>"
+            )
+        for p in delta.changed_pnotes:
+            rows.append(
+                f"<tr class='delta-changed'>"
+                f"<td class='delta-label'>{e(p.get('name','?'))}</td>"
+                f"<td class='delta-prev'>{e(p.get('prev_status','?'))}</td>"
+                f"<td class='delta-arrow'>&rarr;</td>"
+                f"<td class='delta-curr'>{e(p.get('curr_status','?'))}</td>"
+                f"<td class='delta-change'>status changed</td>"
+                f"</tr>"
+            )
+
+    # ── HCP changes ───────────────────────────────────────────────────
+    if delta.new_hcp_issues or delta.resolved_hcp_issues:
+        rows += _delta_group_header("HCP Status Changes")
+        for h in delta.new_hcp_issues:
+            rows.append(
+                f"<tr class='delta-flagged'>"
+                f"<td class='delta-label'>VS{h.get('vsid','?')} {e(h.get('test_name','?'))}</td>"
+                f"<td class='delta-prev'>{e(h.get('prev_status','?'))}</td>"
+                f"<td class='delta-arrow'>&rarr;</td>"
+                f"<td class='delta-curr'>{e(h.get('curr_status','?'))}</td>"
+                f"<td class='delta-change'>&#9888; new issue</td>"
+                f"</tr>"
+            )
+        for h in delta.resolved_hcp_issues:
+            rows.append(
+                f"<tr class='delta-resolved'>"
+                f"<td class='delta-label'>VS{h.get('vsid','?')} {e(h.get('test_name','?'))}</td>"
+                f"<td class='delta-prev'>{e(h.get('prev_status','?'))}</td>"
+                f"<td class='delta-arrow'>&rarr;</td>"
+                f"<td class='delta-curr'>{e(h.get('curr_status','?'))}</td>"
+                f"<td class='delta-change'>&#10003; cleared</td>"
+                f"</tr>"
+            )
+
+    table = (
+        "<table class='delta-table'>"
+        "<thead><tr>"
+        "<th>Metric</th><th>Previous</th><th></th><th>Current</th><th>Change</th>"
+        "</tr></thead>"
+        "<tbody>" + "\n".join(rows) + "</tbody>"
+        "</table>"
+    )
+
+    body = meta_html + table
+    return _card("Delta Comparison", body)
+
+
+def _delta_group_header(title: str) -> List[str]:
+    return [
+        f"<tr class='delta-group-header'>"
+        f"<td colspan='5'>{e(title)}</td>"
+        f"</tr>"
+    ]
+
+
+def _fmt_elapsed(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}h {m}m"
+
+
+def _delta_item_row(label: str, item: DeltaItem, fmt: str = "{}") -> List[str]:
+    """Render one DeltaItem as a table row. Returns [] if unchanged/n/a."""
+    if item.direction in ("n/a", "unchanged"):
+        return []
+
+    cls = "delta-flagged" if item.flagged else "delta-changed"
+    flag_icon = " &#9888;" if item.flagged else ""
+
+    if item.direction == "reset":
+        prev_s = str(item.prev)
+        curr_s = str(item.curr)
+        change_s = "&#9888; counter reset (reboot?)"
+        cls = "delta-flagged"
+    elif item.direction in ("new", "gone"):
+        prev_s = "&mdash;" if item.direction == "new" else str(item.prev)
+        curr_s = str(item.curr) if item.direction == "new" else "&mdash;"
+        change_s = f"[{item.direction}]"
+    elif item.delta is not None:
+        try:
+            prev_s = fmt.format(item.prev)
+            curr_s = fmt.format(item.curr)
+            sign = "+" if item.delta >= 0 else ""
+            change_s = f"{sign}{fmt.format(item.delta)}{flag_icon}"
+        except (TypeError, ValueError):
+            prev_s, curr_s = str(item.prev), str(item.curr)
+            change_s = str(item.delta)
+    else:
+        prev_s = str(item.prev)
+        curr_s = str(item.curr)
+        change_s = "changed" + flag_icon
+
+    reason_html = ""
+    if item.flagged and item.flag_reason:
+        reason_html = f"<br><small class='delta-reason'>{e(item.flag_reason)}</small>"
+
+    return [
+        f"<tr class='{cls}'>"
+        f"<td class='delta-label'>{label}</td>"
+        f"<td class='delta-prev'>{prev_s}</td>"
+        f"<td class='delta-arrow'>&rarr;</td>"
+        f"<td class='delta-curr'>{curr_s}</td>"
+        f"<td class='delta-change'>{change_s}{reason_html}</td>"
+        f"</tr>"
+    ]
+
+
 def _card(title: str, content: str, collapsible: bool = False) -> str:
     if collapsible:
         inner = _collapsible(title, content)
@@ -594,6 +806,35 @@ td.blades {{ font-size: 0.8rem; color: #aaa; }}
   background: #0f1a2e;
   border-radius: 4px;
 }}
+
+/* ---- Delta comparison ---- */
+.delta-meta {{ margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }}
+.delta-meta-item {{ font-size: 0.85rem; color: #aaa; }}
+.delta-meta-item strong {{ color: #e0e0e0; }}
+.delta-note {{ color: #ffa726; }}
+.delta-nochange {{ color: #4caf84; padding: 8px 0; }}
+.delta-table {{ width: 100%; border-collapse: collapse; font-size: 0.85rem; }}
+.delta-table thead th {{
+  text-align: left; padding: 6px 10px;
+  background: #0f2040; color: #7eb8f7;
+  border-bottom: 1px solid #0f3460;
+}}
+.delta-group-header td {{
+  background: #0a1628; color: #555;
+  font-size: 0.78rem; font-weight: 600; letter-spacing: 0.08em;
+  text-transform: uppercase; padding: 8px 10px 4px;
+}}
+.delta-table td {{ padding: 5px 10px; border-bottom: 1px solid #0f1a2e; vertical-align: top; }}
+.delta-label {{ color: #bbb; width: 34%; }}
+.delta-prev {{ color: #888; width: 16%; }}
+.delta-arrow {{ color: #555; width: 4%; text-align: center; }}
+.delta-curr {{ color: #e0e0e0; width: 16%; }}
+.delta-change {{ width: 30%; }}
+.delta-changed .delta-change {{ color: #7eb8f7; }}
+.delta-flagged {{ background: rgba(255,167,38,0.07); }}
+.delta-flagged .delta-change {{ color: #ffa726; font-weight: 600; }}
+.delta-resolved .delta-change {{ color: #4caf84; }}
+.delta-reason {{ color: #888; font-size: 0.78rem; display: block; margin-top: 2px; }}
 
 /* ---- Collapsible sections ---- */
 .toggle {{ display: none; }}

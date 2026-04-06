@@ -18,13 +18,14 @@ Section order matches v18 exactly:
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 from models.data import HealthSummary, VSIDInfo, NCSData
+from models.snapshot import DeltaItem, DeltaReport
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Public entry points
 # ---------------------------------------------------------------------------
 
 def build_summary_lines(s: HealthSummary) -> List[str]:
@@ -44,11 +45,12 @@ def build_summary_lines(s: HealthSummary) -> List[str]:
     return lines
 
 
-def build_full_lines(s: HealthSummary) -> List[str]:
+def build_full_lines(s: HealthSummary, delta: Optional[DeltaReport] = None) -> List[str]:
     """
     Return the full diagnostic output — all collected raw data sections
     followed by the executive summary.
     The logfile renderer uses this; the console renderer uses summary only.
+    When delta is supplied, a delta section is injected after the header.
     """
     lines: List[str] = []
 
@@ -61,6 +63,10 @@ def build_full_lines(s: HealthSummary) -> List[str]:
         f"  Version : {s.platform.cp_version}",
         "",
     ]
+
+    # Delta section immediately after header (if available)
+    if delta is not None:
+        lines += build_delta_section_lines(delta)
 
     # Platform
     lines += _banner("Platform Information")
@@ -475,3 +481,233 @@ def _ncs_topology(s: HealthSummary) -> List[str]:
                     lines.append(f"    {r.dest}/{r.mask} dev {r.dev}")
         lines.append("")
     return lines
+
+
+# ---------------------------------------------------------------------------
+# Delta rendering — plain text
+# ---------------------------------------------------------------------------
+
+def build_delta_banner_lines(delta: DeltaReport) -> List[str]:
+    """
+    Compact delta banner for console output.
+    Shows a one-line summary + any flagged items.
+    """
+    lines: List[str] = []
+    lines += ["", "=" * 62, "  DELTA COMPARISON", "=" * 62]
+
+    elapsed_str = _fmt_elapsed(delta.elapsed_seconds)
+    lines.append(
+        f"  Previous run : {delta.prev_run_id}  ({elapsed_str} ago)"
+    )
+
+    if delta.suppressed:
+        lines.append(
+            "  [Runs less than 2 minutes apart — delta flags suppressed]"
+        )
+
+    if delta.different_members:
+        lines.append(
+            f"  NOTE: Previous run collected from {delta.prev_member}, "
+            f"this run from {delta.curr_member} — failover counts may differ."
+        )
+
+    if not delta.has_changes:
+        lines.append("  No changes detected since previous run.")
+        lines.append("")
+        return lines
+
+    flagged = _collect_flagged_lines(delta)
+    if flagged:
+        lines.append("  Changes requiring attention:")
+        for fl in flagged:
+            lines.append(f"    ! {fl}")
+    else:
+        lines.append(f"  Changes detected (within normal thresholds).")
+
+    lines.append("")
+    return lines
+
+
+def build_delta_section_lines(delta: DeltaReport) -> List[str]:
+    """
+    Full delta section for the log file.
+    Shows all changed metrics, flagged and unflagged.
+    """
+    lines: List[str] = []
+    lines += _banner("Delta Comparison")
+
+    elapsed_str = _fmt_elapsed(delta.elapsed_seconds)
+    lines += [
+        f"  Previous run : {delta.prev_run_id}",
+        f"  Elapsed      : {elapsed_str}",
+    ]
+
+    if delta.suppressed:
+        lines.append(
+            "  [Threshold flags suppressed — runs less than 2 minutes apart]"
+        )
+    if delta.different_members:
+        lines.append(
+            f"  NOTE: Member change detected. "
+            f"Prev={delta.prev_member}  Curr={delta.curr_member}"
+        )
+    lines.append("")
+
+    # ── Cluster ───────────────────────────────────────────────────────
+    lines += _section("Cluster")
+    lines += _delta_row("Failover count",    delta.failover_count)
+    lines += _delta_row("Sync status",       delta.sync_status)
+    lines += _delta_row("Sync lost updates", delta.sync_lost_updates)
+    for member, item in sorted(delta.member_states.items()):
+        lines += _delta_row(f"  {member} state", item)
+
+    # ── Platform ──────────────────────────────────────────────────────
+    lines += _section("Platform")
+    lines += _delta_row("CPU idle %",   delta.cpu_idle_pct,  fmt="{:.1f}%")
+    lines += _delta_row("Swap MB",      delta.swap_used_mb,  fmt="{} MB")
+    lines += _delta_row("Root disk %",  delta.disk_root_pct, fmt="{}%")
+    lines += _delta_row("Log disk %",   delta.disk_log_pct,  fmt="{}%")
+
+    # ── Connections ────────────────────────────────────────────────────
+    lines += _section("Connections (global)")
+    lines += _delta_row("Total connections", delta.total_conn_current)
+
+    # ── Per-VSID ──────────────────────────────────────────────────────
+    lines += _section("Per-VSID")
+    for vsid_int, vd in sorted(delta.vsid_deltas.items()):
+        label = f"VSID {vsid_int} ({vd.name})"
+        lines += _delta_row(f"  {label} conn count", vd.conn_current)
+        lines += _delta_row(f"  {label} conn %",     vd.conn_pct, fmt="{:.1f}%")
+        lines += _delta_row(f"  {label} SecureXL",   vd.securexl_status)
+        for ie in vd.iface_error_deltas:
+            flag = " !" if ie.flagged else ""
+            lines.append(
+                f"    {label} {ie.dev} {ie.direction}: "
+                f"errors {ie.prev_errors}->{ie.curr_errors} "
+                f"(+{ie.delta_errors}), "
+                f"drops {ie.prev_drops}->{ie.curr_drops} "
+                f"(+{ie.delta_drops}){flag}"
+            )
+
+    # ── PNOTE set diff ────────────────────────────────────────────────
+    if delta.new_pnotes or delta.resolved_pnotes or delta.changed_pnotes:
+        lines += _section("PNOTE Changes")
+        for p in delta.new_pnotes:
+            lines.append(f"  + NEW     {p.get('name', '?')}: {p.get('status', '?')}")
+        for p in delta.resolved_pnotes:
+            lines.append(f"  - RESOLVED {p.get('name', '?')}")
+        for p in delta.changed_pnotes:
+            lines.append(
+                f"  ~ CHANGED  {p.get('name', '?')}: "
+                f"{p.get('prev_status', '?')} -> {p.get('curr_status', '?')}"
+            )
+
+    # ── HCP set diff ──────────────────────────────────────────────────
+    if delta.new_hcp_issues or delta.resolved_hcp_issues:
+        lines += _section("HCP Status Changes")
+        for h in delta.new_hcp_issues:
+            lines.append(
+                f"  + NEW     VS{h.get('vsid', '?')} "
+                f"{h.get('test_name', '?')}: "
+                f"{h.get('prev_status', '?')} -> {h.get('curr_status', '?')}"
+            )
+        for h in delta.resolved_hcp_issues:
+            lines.append(
+                f"  - RESOLVED VS{h.get('vsid', '?')} "
+                f"{h.get('test_name', '?')}: "
+                f"{h.get('prev_status', '?')} -> {h.get('curr_status', '?')}"
+            )
+
+    lines.append("")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Delta helpers
+# ---------------------------------------------------------------------------
+
+def _delta_row(label: str, item: DeltaItem, fmt: str = "{}") -> List[str]:
+    """Format one DeltaItem as a single labelled line."""
+    if item.direction in ("n/a", "unchanged"):
+        return []    # omit unchanged metrics — keep the output compact
+
+    flag = " !" if item.flagged else ""
+
+    if item.direction in ("new", "gone"):
+        val = f"[{item.direction}]"
+    elif item.direction == "reset":
+        val = f"{item.prev} -> {item.curr} [RESET — likely reboot]"
+    elif item.delta is not None:
+        sign = "+" if item.delta >= 0 else ""
+        try:
+            prev_s = fmt.format(item.prev)
+            curr_s = fmt.format(item.curr)
+            delt_s = fmt.format(item.delta)
+        except (TypeError, ValueError):
+            prev_s, curr_s, delt_s = str(item.prev), str(item.curr), str(item.delta)
+        val = f"{prev_s} -> {curr_s} ({sign}{delt_s})"
+    else:
+        val = f"{item.prev!r} -> {item.curr!r}"
+
+    reason = f"  [{item.flag_reason}]" if item.flagged and item.flag_reason else ""
+    return [f"  {label:<32} {val}{flag}{reason}"]
+
+
+def _collect_flagged_lines(delta: DeltaReport) -> List[str]:
+    """Return short human-readable lines for all flagged items."""
+    lines: List[str] = []
+
+    for item in [
+        ("Failover count",    delta.failover_count),
+        ("Sync status",       delta.sync_status),
+        ("Sync lost updates", delta.sync_lost_updates),
+        ("CPU idle",          delta.cpu_idle_pct),
+        ("Swap",              delta.swap_used_mb),
+        ("Root disk",         delta.disk_root_pct),
+        ("Log disk",          delta.disk_log_pct),
+        ("Total connections", delta.total_conn_current),
+    ]:
+        label, di = item
+        if di.flagged:
+            lines.append(di.flag_reason or label)
+
+    for member, di in sorted(delta.member_states.items()):
+        if di.flagged:
+            lines.append(di.flag_reason or f"{member} state changed")
+
+    for _vsid, vd in sorted(delta.vsid_deltas.items()):
+        if vd.conn_pct.flagged:
+            lines.append(vd.conn_pct.flag_reason)
+        if vd.securexl_status.flagged:
+            lines.append(vd.securexl_status.flag_reason)
+        for ie in vd.iface_error_deltas:
+            if ie.flagged:
+                lines.append(ie.flag_reason)
+
+    for p in delta.new_pnotes:
+        lines.append(f"New PNOTE: {p.get('name', '?')}: {p.get('status', '?')}")
+
+    for p in delta.changed_pnotes:
+        lines.append(
+            f"PNOTE status changed: {p.get('name', '?')} "
+            f"{p.get('prev_status', '?')} -> {p.get('curr_status', '?')}"
+        )
+
+    for h in delta.new_hcp_issues:
+        lines.append(
+            f"New HCP issue: VS{h.get('vsid', '?')} "
+            f"{h.get('test_name', '?')} -> {h.get('curr_status', '?')}"
+        )
+
+    return lines
+
+
+def _fmt_elapsed(seconds: int) -> str:
+    """Format elapsed seconds as a human-readable string."""
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h}h {m}m"

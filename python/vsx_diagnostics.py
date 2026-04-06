@@ -73,6 +73,8 @@ from collectors.per_vsid import collect_all_vsids
 from collectors.platform import collect_platform
 from collectors.topology import PreflightError, collect_preflight, collect_topology
 from collectors.vsid_discovery import collect_vsid_discovery
+from delta.comparator import compare as delta_compare
+from delta.serialiser import load_prev_snapshot, save_snapshot, snapshot_from_summary
 from health.assessor import assess
 from models.data import HealthSummary
 from renderers.console import render_console
@@ -227,17 +229,32 @@ def run(args: argparse.Namespace) -> int:
     assess(summary)
 
     # ----------------------------------------------------------------
+    # Delta comparison
+    # ----------------------------------------------------------------
+    iso_ts_safe = iso_ts.replace(":", "-")   # filesystem-safe timestamp (reserved for future use)
+    snapshot     = snapshot_from_summary(summary)
+    prev_snapshot = load_prev_snapshot(args.output_dir, iso_ts)
+
+    delta = None
+    if prev_snapshot is not None:
+        delta = delta_compare(prev_snapshot, snapshot)
+
+    # ----------------------------------------------------------------
     # Output paths
     # ----------------------------------------------------------------
     hostname  = summary.topology.active_member or session.hostname or "unknown"
+    stem      = f"vsx_diag_{hostname}_{timestamp}"
     log_path, html_path = _make_output_paths(args.output_dir, hostname, timestamp)
+
+    # Save snapshot alongside the other output files (after paths known)
+    save_snapshot(snapshot, args.output_dir, stem)
 
     # ----------------------------------------------------------------
     # Render
     # ----------------------------------------------------------------
-    render_console(summary)
-    render_logfile(summary, log_path)
-    render_html(summary, html_path)
+    render_console(summary, delta=delta)
+    render_logfile(summary, log_path, delta=delta)
+    render_html(summary, html_path, delta=delta)
 
     return 0
 
