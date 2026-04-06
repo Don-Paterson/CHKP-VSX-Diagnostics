@@ -34,12 +34,13 @@ Log file is written to the same directory as the script.
 Python 3.12 script that connects to the VSX cluster via SSH from the Windows admin
 workstation. No tools need to be installed on the gateway.
 
-Produces four output files on each run:
-- **Console** — executive summary printed to screen, with delta banner if a previous run exists
-- **`.log`** — full plain-text diagnostic (all raw command output + summary + delta section)
-- **`.html`** — self-contained dark-theme report with collapsible sections, RAG badges,
-  cluster member state table, per-VSID status, HCP health check findings, and delta comparison card
-- **`.snapshot.json`** — machine-readable snapshot of key metrics, used for delta comparison on the next run
+Produces five output files on each run:
+- **Console** — executive summary with delta banner (if a previous run exists)
+- **`.log`** — full plain-text diagnostic (all raw command output + delta section + summary)
+- **`.html`** — self-contained dark-theme report: cluster state, per-VSID status, HCP findings, delta comparison card, all-member comparison table
+- **`.json`** — complete machine-readable export (Power BI / Splunk / Grafana)
+- **`.csv`** — flat per-VSID table for pivot tables and time-series joins
+- **`.snapshot.json`** — internal state file for delta comparison on the next run
 
 HCP reports (`hcp -r all`) are automatically downloaded from the gateway via SFTP
 and archived locally per gateway for historical reference.
@@ -65,8 +66,20 @@ across updates.
 # First run — include --fetch to populate NCS topology data (required on R82)
 python C:\vsx_diagnostics\vsx_diagnostics.py --fetch
 
-# Subsequent runs — delta comparison happens automatically
+# Subsequent runs — delta comparison and CPView history collected automatically
 python C:\vsx_diagnostics\vsx_diagnostics.py
+
+# Lab/Skillable environment — suppresses Hyper-V noise, uses loose thresholds
+python C:\vsx_diagnostics\vsx_diagnostics.py --profile lab
+
+# VMware or cloud-hosted gateways
+python C:\vsx_diagnostics\vsx_diagnostics.py --profile virtual
+
+# Query all three cluster members and show per-member differences
+python C:\vsx_diagnostics\vsx_diagnostics.py --all-members
+
+# Combine flags
+python C:\vsx_diagnostics\vsx_diagnostics.py --profile lab --all-members --fetch
 
 # Verbose output — shows each collector as it runs
 python C:\vsx_diagnostics\vsx_diagnostics.py --log-level INFO
@@ -87,7 +100,9 @@ python C:\vsx_diagnostics\vsx_diagnostics.py --help
 | `--password` | *(prompted)* | SSH password |
 | `--expert-password` | *(same as password)* | Expert mode password if different |
 | `--fetch` | off | Run `vsx fetch` before NCS collection — required on R82 first run |
-| `--output-dir` | `C:\vsx_diagnostics\reports` | Directory for `.log`, `.html`, and `.snapshot.json` output files |
+| `--profile` | `production` | Threshold profile: `lab` / `virtual` / `production` |
+| `--all-members` | off | Connect to all reachable cluster members and show per-member differences |
+| `--output-dir` | `C:\vsx_diagnostics\reports` | Directory for all output files |
 | `--hcp-archive` | `C:\vsx_diagnostics\hcp_archive` | Directory for HCP tar.gz archives |
 | `--port` | `22` | SSH port |
 | `--timeout` | `15` | SSH connect timeout (seconds) |
@@ -98,20 +113,23 @@ python C:\vsx_diagnostics\vsx_diagnostics.py --help
 ```
 C:\vsx_diagnostics\
 ├── reports\
-│   ├── vsx_diag_<hostname>_<timestamp>.log           # full plain-text diagnostic
-│   ├── vsx_diag_<hostname>_<timestamp>.html          # self-contained HTML report
-│   └── vsx_diag_<hostname>_<timestamp>.snapshot.json # metrics snapshot for delta comparison
+│   ├── vsx_diag_<hostname>_<timestamp>.log              # full plain-text diagnostic
+│   ├── vsx_diag_<hostname>_<timestamp>.html             # self-contained HTML report
+│   ├── vsx_diag_<hostname>_<timestamp>.json             # machine-readable full export
+│   ├── vsx_diag_<hostname>_<timestamp>.csv              # flat per-VSID table
+│   └── vsx_diag_<hostname>_<timestamp>.snapshot.json    # delta state (internal)
 └── hcp_archive\
     └── <hostname>\
-        └── hcp_report_<hostname>_<timestamp>.tar.gz  # CP HCP report (extract → index.html)
+        └── hcp_report_<hostname>_<timestamp>.tar.gz     # CP HCP report (extract → index.html)
 ```
 
 ---
 
 ## Delta comparison
 
-From the second run onward, the tool automatically compares the current run against
-the most recent previous snapshot and highlights any changes.
+From the second run onward, each run is automatically compared against the most
+recent previous snapshot. Changes are highlighted in the console banner, log file,
+and HTML report.
 
 **What is compared:**
 
@@ -120,27 +138,90 @@ the most recent previous snapshot and highlights any changes.
 | Cluster | Failover count, sync status, sync lost updates, per-member state |
 | Platform | CPU idle %, swap used (MB), root disk %, /var/log disk % |
 | Connections | Total connection count (global), per-VSID connection % of limit |
-| SecureXL | Status per firewall VSID (any change flagged) |
-| Interfaces | Cumulative RX/TX error and drop counters per VSID (increase flagged) |
-| PNOTEs | New, resolved, and status-changed entries in the Problem Notification table |
-| HCP | Tests that moved from PASSED to ERROR/WARNING/INFO, and vice versa |
+| SecureXL | Status per firewall VSID |
+| Interfaces | Cumulative RX/TX error and drop counters per VSID |
+| PNOTEs | New, resolved, and status-changed entries |
+| HCP | Tests that moved between PASSED and ERROR/WARNING/INFO |
 
-**Flagging behaviour:**
+Cluster state events (failover, sync loss, member state change) are always flagged.
+Resource metrics are only flagged when the change exceeds the active profile's thresholds.
+Runs less than the profile's minimum gap apart have resource flags suppressed.
 
-- Cluster state events (failover, sync loss, member state change) are **always flagged** — never suppressed
-- Resource metrics (CPU, disk, swap, connections) are flagged only when the change exceeds a threshold
-- If two runs are less than 2 minutes apart, resource flags are suppressed (lab re-run noise)
-- Interface error counters that decrease (counter reset) are flagged as a reboot/bounce indicator
-- When the current and previous runs were collected from different cluster members, a provenance note is shown
+---
 
-**Where delta appears:**
+## All-member collection (`--all-members`)
 
-- **Console** — compact banner listing any flagged changes, printed before the main summary
-- **Log file** — full delta section injected after the header, showing all changed metrics
-- **HTML report** — "Delta Comparison" card with a colour-coded table (amber = flagged, green = resolved)
+When `--all-members` is specified, the tool connects to each reachable cluster member
+in turn and collects a targeted health snapshot: version, JHF take, CPU, disk, swap,
+sync status, failover count, CoreXL instances, and interface error counters.
 
-The snapshot file is compact ASCII JSON (typically under 5 KB) and contains only the
-metrics needed for comparison — not raw command output.
+Cross-member differences are then compared and surfaced in a dedicated section:
+
+- **Exact-match metrics** (version, JHF take, CoreXL count, sync status, failover count) — any difference is flagged
+- **Spread-based metrics** (CPU idle %, disk %, swap) — flagged if spread exceeds the profile threshold
+- **Cluster state view disagreements** — flagged as a potential split-brain indicator
+- **Per-member interface errors** — flagged per member
+
+The primary session (already open) is reused for the first member; fresh connections
+are opened for the remaining members.
+
+---
+
+## Threshold profiles (`--profile`)
+
+Three built-in profiles control all health assessment and delta comparison thresholds:
+
+| Threshold | `lab` | `virtual` | `production` |
+|-----------|-------|-----------|--------------|
+| CPU idle warn | < 20% | < 35% | < 50% |
+| Swap warn | > 500 MB | > 200 MB | > 100 MB |
+| Connection warn | ≥ 90% | ≥ 85% | ≥ 80% |
+| Disk warn | ≥ 90% | ≥ 85% | ≥ 80% |
+| WARP iface errors | INFO (suppressed) | WARNING | WARNING |
+| Iface error rate floor | 0% | 0.5% | 0% |
+| Delta min gap | 300s | 180s | 120s |
+| Delta disk increase | > 10 pp | > 7 pp | > 5 pp |
+| Member disk spread | > 20 pp | > 15 pp | > 10 pp |
+
+**`lab`** — designed for Hyper-V/Skillable environments. Suppresses WARP interface
+errors (expected noise with no physical LACP partner), uses loose CPU/swap/disk
+thresholds, and allows a longer gap between runs before flagging resource changes.
+
+**`virtual`** — for VMware or cloud-hosted gateways that run warmer than bare-metal
+but cooler than a lab VM.
+
+**`production`** — matches v18 and CP best practice. This is the default.
+
+---
+
+## CPView historical CPU data
+
+When `/var/log/CPView_history/cpu` is present on the gateway (CPView daemon running),
+the tool reads the history file directly to extract 5-minute, 15-minute, and 1-hour
+CPU idle averages. These supplement the 1-second `mpstat` snapshot and appear in the
+Health Indicators section of the HTML report and in the JSON export under
+`platform.cpview_cpu_5m_idle`, `cpview_cpu_15m_idle`, and `cpview_cpu_1h_idle`.
+
+If the history directory is absent, a `cpview -s -t` command fallback is attempted.
+If both fail, `cpview_available: false` is recorded and the tool continues without error.
+
+---
+
+## Machine-readable export
+
+Every run produces a `.json` and `.csv` file alongside the HTML report.
+
+**JSON** (`schema_version: "1"`) — complete structured export including run metadata,
+platform (with CPView averages), cluster health, per-VSID table, attention items,
+HCP results, delta summary, and member comparison summary.
+
+**CSV** — one row per VSID, with run-level metadata duplicated on each row for
+easy pivot and time-series join on `run_id + vsid`.
+
+**Ingestion:**
+- **Power BI** — Get Data → Text/CSV (use the `.csv`), or JSON connector (use the `.json`)
+- **Splunk** — HTTP Event Collector or file monitor; `run.run_id` maps to `_time`
+- **Grafana** — JSON datasource plugin or CSV datasource for table panels
 
 ---
 
@@ -151,18 +232,20 @@ The Python tool runs the following in order on each execution:
 1. SSH connect to first available cluster member
 2. Preflight checks (root / expert mode, `$FWDIR`, `vsx` availability)
 3. Platform info (`fw ver`, `cpinfo` JHF take, `uname`, `uptime`, `df`, `cplic`)
-4. Optional: `vsx fetch` (with `--fetch`)
-5. Cluster topology (`local.vsall` → member IPs, VIP, management server)
-6. VSX overview + VSID discovery (`vsx stat -v` / `-l`)
-7. NCS topology (`vsx showncs` per VSID — file-redirect workaround for R82)
-8. Per-VSID diagnostics via `vsenv` subshells (blades, CPU, routing, interfaces, SecureXL, connections)
-9. CoreXL & affinity (`fw ctl multik stat`, `fw ctl affinity -l`)
-10. Cluster health (`cphaprob stat/syncstat`, `cpstat ha -f all`)
-11. HCP health check (`hcp -r all` + SFTP download of tar.gz report)
-12. Health assessment — 16 threshold rules applied, ATTENTION items generated
-13. Delta comparison — current run compared against most recent snapshot (if available)
-14. Snapshot saved to `.snapshot.json`
-15. Render: console summary + log file + HTML report
+4. CPView historical CPU data (`/var/log/CPView_history/cpu` or `cpview -s -t` fallback)
+5. Optional: `vsx fetch` (with `--fetch`)
+6. Cluster topology (`local.vsall` → member IPs, VIP, management server)
+7. VSX overview + VSID discovery (`vsx stat -v` / `-l`)
+8. NCS topology (`vsx showncs` per VSID — file-redirect workaround for R82)
+9. Per-VSID diagnostics via `vsenv` subshells (blades, CPU, routing, interfaces, SecureXL, connections)
+10. CoreXL & affinity (`fw ctl multik stat`, `fw ctl affinity -l`)
+11. Cluster health (`cphaprob stat/syncstat`, `cpstat ha -f all`)
+12. HCP health check (`hcp -r all` + SFTP download of tar.gz report)
+13. Optional: all-member health collection (with `--all-members`)
+14. Health assessment — threshold rules applied using active profile
+15. Delta comparison — current run compared against most recent snapshot
+16. Snapshot saved to `.snapshot.json`
+17. Render: console + log + HTML + JSON + CSV
 
 ---
 
@@ -185,23 +268,28 @@ The Python tool runs the following in order on each execution:
 
 ```
 python/
-├── install.ps1                   # One-liner deployer for A-GUI
-├── requirements.txt              # paramiko==3.5.1
-├── vsx_diagnostics.py            # Entry point / CLI
+├── install.ps1                     # One-liner deployer for A-GUI
+├── requirements.txt                # paramiko==3.5.1
+├── vsx_diagnostics.py              # Entry point / CLI
 └── vsx_diagnostics_py/
     ├── models/
-    │   ├── data.py               # All dataclasses (ClusterTopology, VSIDInfo, HealthSummary ...)
-    │   └── snapshot.py           # RunSnapshot, DeltaItem, VSIDDelta, DeltaReport
-    ├── transport/ssh.py          # Paramiko SSH — ExpertSession, connect_to_cluster(), SFTP
-    ├── collectors/               # One module per data collection area
-    │   ├── topology.py           # Preflight + local.vsall
-    │   ├── vsid_discovery.py     # vsx stat
-    │   ├── ncs.py                # vsx showncs (file-redirect workaround)
-    │   ├── per_vsid.py           # vsenv subshell diagnostics
-    │   ├── cluster_health.py     # cphaprob + cpstat
-    │   ├── hcp.py                # hcp -r all + SFTP download
-    │   └── platform.py           # fw ver, cpinfo, uptime, disk, cplic
-    ├── parsers/                  # Pure functions: raw string → dataclass (no SSH)
+    │   ├── data.py                 # Core dataclasses (ClusterTopology, VSIDInfo, HealthSummary ...)
+    │   ├── snapshot.py             # RunSnapshot, DeltaItem, DeltaReport
+    │   ├── member.py               # MemberSnapshot, MemberComparison
+    │   └── thresholds.py           # ThresholdProfile — lab / virtual / production presets
+    ├── transport/ssh.py            # Paramiko SSH — ExpertSession, connect_to_cluster(), SFTP
+    ├── collectors/
+    │   ├── topology.py             # Preflight + local.vsall
+    │   ├── vsid_discovery.py       # vsx stat
+    │   ├── ncs.py                  # vsx showncs (file-redirect workaround)
+    │   ├── per_vsid.py             # vsenv subshell diagnostics
+    │   ├── cluster_health.py       # cphaprob + cpstat
+    │   ├── hcp.py                  # hcp -r all + SFTP download
+    │   ├── platform.py             # fw ver, cpinfo, uptime, disk, cplic, CPView
+    │   ├── cpview.py               # CPView history file reader + cmd fallback
+    │   ├── member_health.py        # Per-member SSH collection (--all-members)
+    │   └── member_comparator.py    # Cross-member diff (pure function, profile-aware)
+    ├── parsers/                    # Pure functions: raw string → dataclass (no SSH)
     │   ├── vsx_stat.py
     │   ├── vsall.py
     │   ├── ncs_data.py
@@ -211,25 +299,24 @@ python/
     │   ├── affinity.py
     │   ├── securexl.py
     │   └── iface_errors.py
-    ├── delta/                    # Delta comparison (no SSH, no rendering)
-    │   ├── comparator.py         # Pure compare(prev, curr) → DeltaReport
-    │   └── serialiser.py         # snapshot_from_summary(), save_snapshot(), load_prev_snapshot()
-    ├── health/assessor.py        # 16 threshold rules → AttentionItem list
+    ├── delta/
+    │   ├── comparator.py           # Pure compare(prev, curr, profile) → DeltaReport
+    │   └── serialiser.py           # snapshot_from_summary(), save/load snapshot JSON
+    ├── health/assessor.py          # Threshold rules → AttentionItem list (profile-aware)
     └── renderers/
-        ├── text_builder.py       # Shared text output engine (summary + delta sections)
-        ├── console.py            # stdout executive summary + delta banner
-        ├── logfile.py            # Full plain-text log + delta section
-        └── html.py               # Self-contained HTML report + delta comparison card
+        ├── text_builder.py         # Shared text engine (summary + delta + member sections)
+        ├── console.py              # stdout summary + delta banner
+        ├── logfile.py              # Full plain-text log + delta section
+        ├── html.py                 # Self-contained HTML report
+        └── export.py               # Machine-readable JSON + CSV export
 ```
 
-Parsers and the delta comparator are pure functions (no SSH calls) making them
-independently testable against captured gateway output without needing a live cluster.
+Parsers, the delta comparator, and the member comparator are pure functions
+(no SSH calls) — independently testable against captured output without a live cluster.
 
 ---
 
 ## Key technical notes
-
-These lessons from v18 bash development are encoded in the Python tool:
 
 - `vsenv` kills its calling shell — all per-VS commands run in fresh `exec_command` channels
 - `vsx showncs` suppresses stdout in subshell capture — output redirected to remote temp file
@@ -240,8 +327,11 @@ These lessons from v18 bash development are encoded in the Python tool:
 - `cpstat ha -f all` PNOTE parsing scoped strictly to the `Problem Notification table` section only
 - SecureXL status: R82 KPPAK pipe-table format — status is field index 3 after pipe-split
 - `hcp -r all` output contains ANSI colour codes and `\r` Working lines — stripped before parsing
-- Hyper-V LACP bond sync warnings are expected noise — downgraded from WARNING to INFO automatically
-- Interface error counters are cumulative — delta comparison flags increases, and flags decreases as counter resets
+- Hyper-V LACP bond sync warnings downgraded from WARNING to INFO automatically (Bond Health heuristic)
+- WARP interface (`wrp*`) errors downgraded to INFO on `--profile lab` — Hyper-V virtual switch noise
+- CPView history files use two column formats: 6-column (R80/R81) and 7-column (R82) — both parsed
+- Delta comparison is profile-aware — lab profile uses wider thresholds and a 5-minute suppression window
+- Snapshot files are ASCII JSON, typically under 5 KB, stored alongside `.log` and `.html` per run
 
 ---
 
