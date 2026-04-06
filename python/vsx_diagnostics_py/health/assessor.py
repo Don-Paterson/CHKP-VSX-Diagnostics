@@ -82,7 +82,7 @@ def assess(
     _check_memory(summary, profile)
     _check_connections(summary, profile)
     _check_disk(summary, profile)
-    _check_iface_errors(summary)
+    _check_iface_errors(summary, profile)
     _check_hcp(summary)
 
     if summary.attention_items:
@@ -238,8 +238,15 @@ def _check_disk(summary: HealthSummary, profile: ThresholdProfile) -> None:
              f"Log filesystem (/var/log) at {summary.platform.disk_log_pct}")
 
 
-def _check_iface_errors(summary: HealthSummary) -> None:
-    """Rule 14 — interface errors with error rate annotation."""
+def _check_iface_errors(summary: HealthSummary, profile: ThresholdProfile) -> None:
+    """Rule 14 — interface errors with error rate annotation.
+
+    On lab profile with warp_error_suppress=True, WARP interfaces (wrp*)
+    are downgraded to INFO rather than WARNING — they generate constant
+    RX errors on Hyper-V due to no real LACP partner.
+
+    On virtual profile, errors below iface_error_rate_warn_pct are skipped.
+    """
     monitored = set(summary.cluster_health.monitored_ifaces)
 
     for vsid_info in summary.vsids:
@@ -247,10 +254,24 @@ def _check_iface_errors(summary: HealthSummary) -> None:
         if not diag:
             continue
         for err in diag.iface_errors:
+            is_warp = err.dev.startswith("wrp")
+
+            # Apply error rate threshold — skip if below minimum
+            if (profile.iface_error_rate_warn_pct > 0
+                    and err.error_rate_pct is not None
+                    and err.error_rate_pct < profile.iface_error_rate_warn_pct):
+                log.debug(
+                    "Skipping %s %s iface error (%.2f%% < threshold %.2f%%)",
+                    vsid_info.name, err.dev,
+                    err.error_rate_pct, profile.iface_error_rate_warn_pct,
+                )
+                continue
+
             mon_note = (
                 "" if err.dev in monitored
                 else " [not cluster-monitored — will not trigger failover]"
             )
+
             if err.errors > 0 and err.error_rate_pct is not None:
                 msg = (
                     f"VSID {vsid_info.vsid} ({vsid_info.name}) "
@@ -264,8 +285,13 @@ def _check_iface_errors(summary: HealthSummary) -> None:
                     f"{err.dev}: {err.direction}_err={err.errors} "
                     f"{err.direction}_drop={err.drops}{mon_note}"
                 )
-            _add(summary, "WARNING", "Interface Errors", msg)
 
+            # WARP on lab: downgrade to INFO with explanation
+            if is_warp and profile.warp_error_suppress:
+                msg += " [WARP/Hyper-V — expected noise, suppressed on lab profile]"
+                _add(summary, "INFO", "Interface Errors", msg)
+            else:
+                _add(summary, "WARNING", "Interface Errors", msg)
 
 def _check_hcp(summary: HealthSummary) -> None:
     """Rules 15 & 16 — HCP ERROR and INFO results."""

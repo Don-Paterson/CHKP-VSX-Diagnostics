@@ -61,6 +61,12 @@ class ThresholdProfile:
     # Rules 12 & 13: Disk — flag if usage >= this %
     disk_warn_pct: int = 80
 
+    # Rule 14: Interface errors
+    # Minimum error rate % to flag (errors below this are noise)
+    iface_error_rate_warn_pct: float = 0.0   # 0 = flag any non-zero error rate
+    # Suppress WARP interface errors (wrp* devices) — expected on Hyper-V virtual switches
+    warp_error_suppress: bool = False
+
     # ── Delta comparator thresholds (delta/comparator.py) ────────────
     # Minimum elapsed time between runs before resource flags are raised
     delta_min_gap_seconds: int = 120
@@ -106,6 +112,8 @@ _PROFILES: Dict[str, ThresholdProfile] = {
         swap_warn_mb        = 100,
         conn_warn_pct       = 80,
         disk_warn_pct       = 80,
+        iface_error_rate_warn_pct = 0.0,   # flag any non-zero error rate
+        warp_error_suppress = False,
         # Delta
         delta_min_gap_seconds       = 120,
         delta_cpu_drop_pp           = 10,
@@ -127,6 +135,8 @@ _PROFILES: Dict[str, ThresholdProfile] = {
         swap_warn_mb        = 200,
         conn_warn_pct       = 85,
         disk_warn_pct       = 85,
+        iface_error_rate_warn_pct = 0.5,   # ignore sub-0.5% error rates (virtual NIC noise)
+        warp_error_suppress = False,
         # Delta — wider gaps expected between diagnostic runs
         delta_min_gap_seconds       = 180,
         delta_cpu_drop_pp           = 15,
@@ -153,6 +163,10 @@ _PROFILES: Dict[str, ThresholdProfile] = {
         swap_warn_mb        = 500,
         conn_warn_pct       = 90,
         disk_warn_pct       = 90,
+        # WARP interfaces on Hyper-V produce constant RX errors due to
+        # no real LACP partner — suppress entirely on lab profile
+        iface_error_rate_warn_pct = 0.0,
+        warp_error_suppress = True,
         # Delta — runs are often back-to-back during demos; use a 5-minute
         # suppression window and wide change tolerances
         delta_min_gap_seconds       = 300,
