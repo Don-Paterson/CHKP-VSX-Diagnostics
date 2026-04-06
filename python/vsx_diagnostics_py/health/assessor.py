@@ -40,24 +40,37 @@ Bond Health HCP ERROR on Hyper-V:
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from models.data import AttentionItem, HealthSummary
+from models.thresholds import ThresholdProfile, get_profile, DEFAULT_PROFILE
 
 log = logging.getLogger(__name__)
 
-# Thresholds (match v18 exactly)
-_CPU_IDLE_WARN_PCT   = 50     # flag if idle < this
-_SWAP_WARN_MB        = 100    # flag if swap used > this
-_CONN_WARN_PCT       = 80     # flag if connections >= this % of limit
-_DISK_WARN_PCT       = 80     # flag if disk usage >= this %
+# Legacy module-level constants kept for reference — actual values come from
+# the active ThresholdProfile passed into assess().
+_CPU_IDLE_WARN_PCT   = 50
+_SWAP_WARN_MB        = 100
+_CONN_WARN_PCT       = 80
+_DISK_WARN_PCT       = 80
 
 
-def assess(summary: HealthSummary) -> HealthSummary:
+def assess(
+    summary: HealthSummary,
+    profile: Optional[ThresholdProfile] = None,
+) -> HealthSummary:
     """
     Apply all health rules to summary and populate summary.attention_items.
     Returns the same object (mutated in place).
+
+    Parameters
+    ----------
+    summary : fully populated HealthSummary
+    profile : ThresholdProfile to use; defaults to 'production' if None
     """
+    if profile is None:
+        profile = get_profile(DEFAULT_PROFILE)
+
     summary.attention_items.clear()
 
     _check_cluster_sync(summary)
@@ -65,10 +78,10 @@ def assess(summary: HealthSummary) -> HealthSummary:
     _check_cluster_degraded(summary)
     _check_pnotes(summary)
     _check_securexl(summary)
-    _check_cpu(summary)
-    _check_memory(summary)
-    _check_connections(summary)
-    _check_disk(summary)
+    _check_cpu(summary, profile)
+    _check_memory(summary, profile)
+    _check_connections(summary, profile)
+    _check_disk(summary, profile)
     _check_iface_errors(summary)
     _check_hcp(summary)
 
@@ -161,39 +174,39 @@ def _check_securexl(summary: HealthSummary) -> None:
                  f"({vsid_info.name}): {status}")
 
 
-def _check_cpu(summary: HealthSummary) -> None:
+def _check_cpu(summary: HealthSummary, profile: ThresholdProfile) -> None:
     """Rule 8 — CPU idle below threshold (VS0)."""
     diag0 = summary.vsid_diags.get(0)
     if not diag0 or diag0.cpu_idle_pct is None:
         return
 
-    if diag0.cpu_idle_pct < _CPU_IDLE_WARN_PCT:
+    if diag0.cpu_idle_pct < profile.cpu_idle_warn_pct:
         _add(summary, "CRITICAL", "CPU",
-             f"CPU idle below {_CPU_IDLE_WARN_PCT}%: "
+             f"CPU idle below {profile.cpu_idle_warn_pct}%: "
              f"{diag0.cpu_idle_pct:.1f}% idle "
              f"(load avg: {summary.platform.load_avg or '?'})")
 
 
-def _check_memory(summary: HealthSummary) -> None:
+def _check_memory(summary: HealthSummary, profile: ThresholdProfile) -> None:
     """Rule 9 — swap usage above threshold (VS0)."""
     diag0 = summary.vsid_diags.get(0)
     if not diag0:
         return
 
-    if diag0.swap_used_mb > _SWAP_WARN_MB:
+    if diag0.swap_used_mb > profile.swap_warn_mb:
         _add(summary, "WARNING", "Memory",
              f"Swap in use: {diag0.swap_used_mb} MB "
-             f"(threshold: {_SWAP_WARN_MB} MB)")
+             f"(threshold: {profile.swap_warn_mb} MB)")
 
 
-def _check_connections(summary: HealthSummary) -> None:
+def _check_connections(summary: HealthSummary, profile: ThresholdProfile) -> None:
     """Rules 10 & 11 — total and per-VSID connection capacity."""
     ov = summary.vsx_overview
 
     # Rule 10 — total cluster connections
     if ov.total_conn_limit > 0:
         pct = (ov.total_conn_current * 100) // ov.total_conn_limit
-        if pct >= _CONN_WARN_PCT:
+        if pct >= profile.conn_warn_pct:
             _add(summary, "CRITICAL", "Connections",
                  f"Total connection usage at {pct}% of cluster limit "
                  f"({ov.total_conn_current}/{ov.total_conn_limit})")
@@ -205,22 +218,22 @@ def _check_connections(summary: HealthSummary) -> None:
         diag = summary.vsid_diags.get(vsid_info.vsid)
         conn = diag.conn_current if diag else vsid_info.conn_current
         pct = (conn * 100) // vsid_info.conn_limit
-        if pct >= _CONN_WARN_PCT:
+        if pct >= profile.conn_warn_pct:
             _add(summary, "CRITICAL", "Connections",
                  f"VSID {vsid_info.vsid} ({vsid_info.name}) at {pct}% "
                  f"connection capacity ({conn}/{vsid_info.conn_limit})")
 
 
-def _check_disk(summary: HealthSummary) -> None:
+def _check_disk(summary: HealthSummary, profile: ThresholdProfile) -> None:
     """Rules 12 & 13 — disk usage."""
     root_pct = _pct_int(summary.platform.disk_root_pct)
     log_pct  = _pct_int(summary.platform.disk_log_pct)
 
-    if root_pct is not None and root_pct >= _DISK_WARN_PCT:
+    if root_pct is not None and root_pct >= profile.disk_warn_pct:
         _add(summary, "WARNING", "Disk",
              f"Root filesystem at {summary.platform.disk_root_pct}")
 
-    if log_pct is not None and log_pct >= _DISK_WARN_PCT:
+    if log_pct is not None and log_pct >= profile.disk_warn_pct:
         _add(summary, "WARNING", "Disk",
              f"Log filesystem (/var/log) at {summary.platform.disk_log_pct}")
 

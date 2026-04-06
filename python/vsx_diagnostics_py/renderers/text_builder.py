@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from models.data import HealthSummary, VSIDInfo, NCSData
+from models.member import MemberComparison
 from models.snapshot import DeltaItem, DeltaReport
 
 
@@ -39,6 +40,8 @@ def build_summary_lines(s: HealthSummary) -> List[str]:
     lines += _traffic_flow(s)
     lines += _vsid_status_table(s)
     lines += _health_section(s)
+    if s.member_comparison is not None:
+        lines += build_member_section_lines(s.member_comparison)
     lines += _attention_section(s)
     lines += _footer(s)
 
@@ -194,6 +197,7 @@ def _environment(s: HealthSummary) -> List[str]:
         f"{gw_count} configured",
         f"  Management: {t.mgmt_server or '?'}  "
         f"Cluster VIP: {t.cluster_vip or '?'}",
+        f"  Threshold profile: {s.active_profile}",
         "",
     ]
     return lines
@@ -711,3 +715,88 @@ def _fmt_elapsed(seconds: int) -> str:
     h = seconds // 3600
     m = (seconds % 3600) // 60
     return f"{h}h {m}m"
+
+
+# ---------------------------------------------------------------------------
+# All-member comparison rendering
+# ---------------------------------------------------------------------------
+
+def build_member_section_lines(mc: MemberComparison) -> List[str]:
+    """
+    Render the all-member comparison as plain text lines.
+    Included in both console summary and log file.
+    """
+    lines: List[str] = []
+    lines += ["CLUSTER MEMBER COMPARISON"]
+
+    reachable = [s for s in mc.snapshots if s.reachable]
+    total     = len(mc.snapshots)
+
+    if mc.unreachable:
+        lines.append(
+            f"  ! Unreachable members: {', '.join(mc.unreachable)}"
+        )
+
+    if len(reachable) < 2:
+        lines.append("  [Fewer than 2 members reachable — cross-member comparison skipped]")
+        lines.append("")
+        return lines
+
+    lines.append(f"  {len(reachable)}/{total} members reachable")
+    lines.append("")
+
+    # ── Per-member summary table ───────────────────────────────────────
+    hdr = (f"  {'Member':<14} {'State':<10} {'Ver':<6} {'JHF':<5} "
+           f"{'CPU%idle':<10} {'Root%':<7} {'Log%':<7} {'Sync':<14} {'Load'}")
+    sep = "  " + "-" * (len(hdr) - 2)
+    lines += [hdr, sep]
+
+    for snap in sorted(reachable, key=lambda s: s.name):
+        cpu = f"{snap.cpu_idle_pct:.1f}" if snap.cpu_idle_pct is not None else "n/a"
+        lines.append(
+            f"  {snap.name:<14} {snap.own_state:<10} "
+            f"{snap.cp_version_short:<6} {snap.jhf_take:<5} "
+            f"{cpu:<10} {snap.disk_root_pct:<7} {snap.disk_log_pct:<7} "
+            f"{snap.sync_status:<14} {snap.load_avg}"
+        )
+    lines.append("")
+
+    # ── Differences ───────────────────────────────────────────────────
+    if not mc.diffs:
+        lines.append("  All members are consistent — no differences detected.")
+        lines.append("")
+        return lines
+
+    flagged = [d for d in mc.diffs if d.flagged]
+    info    = [d for d in mc.diffs if not d.flagged]
+
+    if flagged:
+        lines.append(f"  Differences requiring attention ({len(flagged)}):")
+        for diff in flagged:
+            lines.append(f"    ! {diff.metric}")
+            for member, val in sorted(diff.member_values.items()):
+                lines.append(f"        {member}: {val}")
+            if diff.note:
+                lines.append(f"      [{diff.note}]")
+        lines.append("")
+
+    if info:
+        lines.append(f"  Other differences ({len(info)}):")
+        for diff in info:
+            lines.append(f"    ~ {diff.metric}")
+            for member, val in sorted(diff.member_values.items()):
+                lines.append(f"        {member}: {val}")
+        lines.append("")
+
+    # ── Interface errors per member ────────────────────────────────────
+    for snap in reachable:
+        if snap.iface_errors:
+            lines.append(f"  Interface errors on {snap.name}:")
+            for err in snap.iface_errors:
+                lines.append(
+                    f"    {err.dev} {err.direction}: "
+                    f"errors={err.errors} drops={err.drops}"
+                )
+            lines.append("")
+
+    return lines

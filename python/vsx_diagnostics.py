@@ -68,6 +68,8 @@ for _p in (_HERE, _PKG_DIR):
 
 from collectors.cluster_health import collect_cluster_health
 from collectors.hcp import collect_hcp
+from collectors.member_comparator import compare_members
+from collectors.member_health import collect_all_members
 from collectors.ncs import collect_ncs
 from collectors.per_vsid import collect_all_vsids
 from collectors.platform import collect_platform
@@ -77,7 +79,9 @@ from delta.comparator import compare as delta_compare
 from delta.serialiser import load_prev_snapshot, save_snapshot, snapshot_from_summary
 from health.assessor import assess
 from models.data import HealthSummary
+from models.thresholds import ThresholdProfile, get_profile, VALID_PROFILES, DEFAULT_PROFILE
 from renderers.console import render_console
+from renderers.export import render_export
 from renderers.html import render_html
 from renderers.logfile import render_logfile
 from transport.ssh import SSHError, connect_to_cluster
@@ -136,6 +140,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--timeout", type=int, default=15,
         help="SSH connect timeout in seconds (default: 15)",
+    )
+    p.add_argument(
+        "--profile", default=DEFAULT_PROFILE,
+        choices=VALID_PROFILES,
+        help=(
+            f"Threshold profile: lab / virtual / production "
+            f"(default: {DEFAULT_PROFILE}). "
+            f"'lab' suppresses noise in Hyper-V/Skillable environments."
+        ),
+    )
+    p.add_argument(
+        "--all-members", action="store_true", dest="all_members",
+        help="Connect to all reachable cluster members and highlight per-member differences",
     )
     p.add_argument(
         "--log-level", default="WARNING",
@@ -207,7 +224,7 @@ def run(args: argparse.Namespace) -> int:
 
     with session:
         try:
-            _collect_all(session, summary, args)
+            _collect_all(session, summary, args, password=password, expert_password=expert_password)
         except PreflightError as e:
             print(f"\nPREFLIGHT FAILED: {e}", file=sys.stderr)
             return 1
@@ -224,9 +241,16 @@ def run(args: argparse.Namespace) -> int:
             )
 
     # ----------------------------------------------------------------
+    # Load threshold profile
+    # ----------------------------------------------------------------
+    profile = get_profile(args.profile)
+    summary.active_profile = profile.name
+    print(f"  Profile      : {profile.name} — {profile.description}")
+
+    # ----------------------------------------------------------------
     # Assessment
     # ----------------------------------------------------------------
-    assess(summary)
+    assess(summary, profile=profile)
 
     # ----------------------------------------------------------------
     # Delta comparison
@@ -237,7 +261,7 @@ def run(args: argparse.Namespace) -> int:
 
     delta = None
     if prev_snapshot is not None:
-        delta = delta_compare(prev_snapshot, snapshot)
+        delta = delta_compare(prev_snapshot, snapshot, profile=profile)
 
     # ----------------------------------------------------------------
     # Output paths
@@ -255,11 +279,18 @@ def run(args: argparse.Namespace) -> int:
     render_console(summary, delta=delta)
     render_logfile(summary, log_path, delta=delta)
     render_html(summary, html_path, delta=delta)
+    render_export(summary, args.output_dir, stem, delta=delta)
 
     return 0
 
 
-def _collect_all(session, summary: HealthSummary, args: argparse.Namespace) -> None:
+def _collect_all(
+    session,
+    summary: HealthSummary,
+    args: argparse.Namespace,
+    password: str = "",
+    expert_password: str = "",
+) -> None:
     """Run all collectors in order, populating summary in place."""
 
     # 1. Preflight + partial platform
@@ -333,6 +364,27 @@ def _collect_all(session, summary: HealthSummary, args: argparse.Namespace) -> N
         "parse failed (check log)"
     )
     print(f" {hcp_status}")
+
+    # 10. All-member collection (optional)
+    if args.all_members and summary.topology.members:
+        print("  All-member health collection ...")
+        member_snapshots = collect_all_members(
+            primary_session  = session,
+            primary_name     = platform_info.hostname,
+            topology_members = summary.topology.members,
+            username         = args.username,
+            password         = password,
+            expert_password  = expert_password,
+            port             = args.port,
+            timeout          = args.timeout,
+        )
+        profile = get_profile(args.profile)
+        summary.member_comparison = compare_members(member_snapshots, profile=profile)
+        reachable = summary.member_comparison.reachable_count
+        diffs = len(summary.member_comparison.diffs)
+        flagged = sum(1 for d in summary.member_comparison.diffs if d.flagged)
+        print(f"    {reachable}/{len(member_snapshots)} members reached, "
+              f"{diffs} difference(s) found ({flagged} flagged)")
 
 
 # ---------------------------------------------------------------------------

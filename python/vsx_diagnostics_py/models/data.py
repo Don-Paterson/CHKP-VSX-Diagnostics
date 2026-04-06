@@ -17,7 +17,10 @@ Design rules:
 
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from models.member import MemberComparison
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +392,13 @@ class HealthSummary:
     # --- Flags ---
     do_fetch: bool = False
     showncs_available: bool = False
+
+    # --- Active threshold profile ---
+    active_profile: str = "production"   # name of the ThresholdProfile used this run
+
+    # --- All-member collection ---
+    # None until collect_all_members() has run; None if only 1 member reachable
+    member_comparison: Optional["MemberComparison"] = None
 
     @property
     def health_ok(self) -> bool:

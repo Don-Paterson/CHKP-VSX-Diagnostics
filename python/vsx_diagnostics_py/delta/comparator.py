@@ -46,32 +46,47 @@ from models.snapshot import (
     RunSnapshot,
     VSIDDelta,
 )
+from models.thresholds import ThresholdProfile, get_profile, DEFAULT_PROFILE
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Thresholds
+# Thresholds — now supplied via ThresholdProfile; these are fallback defaults
+# only used if someone calls internal helpers directly without a profile.
 # ---------------------------------------------------------------------------
 
-MIN_DELTA_SECONDS    = 120    # suppress resource flags if runs are this close together
-CPU_DROP_WARN_PP     = 10     # percentage points drop in cpu_idle to flag
-SWAP_INCREASE_WARN_MB = 50    # MB increase in swap to flag
-DISK_INCREASE_WARN_PP = 5     # percentage point increase in disk usage to flag
-CONN_INCREASE_WARN_PCT = 20   # relative % increase in total connections to flag
-VSID_CONN_WARN_PP    = 10     # pp increase in per-VSID connection % to flag
+MIN_DELTA_SECONDS    = 120
+CPU_DROP_WARN_PP     = 10
+SWAP_INCREASE_WARN_MB = 50
+DISK_INCREASE_WARN_PP = 5
+CONN_INCREASE_WARN_PCT = 20
+VSID_CONN_WARN_PP    = 10
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def compare(prev: RunSnapshot, curr: RunSnapshot) -> DeltaReport:
+def compare(
+    prev: RunSnapshot,
+    curr: RunSnapshot,
+    profile: Optional[ThresholdProfile] = None,
+) -> DeltaReport:
     """
     Compare two RunSnapshots and return a fully populated DeltaReport.
     prev and curr must not be None (caller checks before calling).
+
+    Parameters
+    ----------
+    prev, curr : RunSnapshots to compare
+    profile    : ThresholdProfile controlling flag thresholds;
+                 defaults to 'production' if None
     """
+    if profile is None:
+        profile = get_profile(DEFAULT_PROFILE)
+
     elapsed = _elapsed_seconds(prev.run_id, curr.run_id)
-    suppress = elapsed < MIN_DELTA_SECONDS
+    suppress = elapsed < profile.delta_min_gap_seconds
 
     report = DeltaReport(
         prev_run_id      = prev.run_id,
@@ -86,57 +101,51 @@ def compare(prev: RunSnapshot, curr: RunSnapshot) -> DeltaReport:
         curr_member = curr.collected_from_host,
     )
 
-    # ── Cluster (never suppressed — state events are always notable) ──
+    # ── Cluster (never suppressed) ────────────────────────────────────
     report.failover_count = _compare_numeric(
         prev.failover_count, curr.failover_count,
         flag_if=lambda d, _p, _c: d > 0,
         flag_reason_fn=lambda d, _p, c: f"failover count increased by {d} (now {c})",
         suppress=False,
     )
-
     report.sync_status = _compare_string(
         prev.sync_status, curr.sync_status,
         flag_if=lambda p, c: c != "OK" or (p == "OK" and c != "OK"),
         flag_reason_fn=lambda p, c: f"sync changed: {p!r} -> {c!r}",
         suppress=False,
     )
-
     report.sync_lost_updates = _compare_numeric(
         prev.sync_lost_updates, curr.sync_lost_updates,
         flag_if=lambda d, _p, _c: d > 0,
         flag_reason_fn=lambda d, _p, c: f"sync lost updates increased by {d} (now {c})",
         suppress=False,
     )
-
     report.member_states = _compare_member_states(prev.member_states, curr.member_states)
 
     # ── Platform ──────────────────────────────────────────────────────
     report.cpu_idle_pct = _compare_numeric_float(
         prev.cpu_idle_pct, curr.cpu_idle_pct,
-        flag_if=lambda d, _p, _c: d is not None and d <= -CPU_DROP_WARN_PP,
+        flag_if=lambda d, _p, _c: d is not None and d <= -profile.delta_cpu_drop_pp,
         flag_reason_fn=lambda d, _p, c: (
             f"CPU idle dropped {abs(d):.1f} pp (now {c:.1f}%)"
         ),
         suppress=suppress,
     )
-
     report.swap_used_mb = _compare_numeric(
         prev.swap_used_mb, curr.swap_used_mb,
-        flag_if=lambda d, _p, _c: d >= SWAP_INCREASE_WARN_MB,
+        flag_if=lambda d, _p, _c: d >= profile.delta_swap_increase_mb,
         flag_reason_fn=lambda d, _p, c: f"swap increased by {d} MB (now {c} MB)",
         suppress=suppress,
     )
-
     report.disk_root_pct = _compare_numeric(
         prev.disk_root_pct, curr.disk_root_pct,
-        flag_if=lambda d, _p, _c: d >= DISK_INCREASE_WARN_PP,
+        flag_if=lambda d, _p, _c: d >= profile.delta_disk_increase_pp,
         flag_reason_fn=lambda d, _p, c: f"root disk grew {d} pp (now {c}%)",
         suppress=suppress,
     )
-
     report.disk_log_pct = _compare_numeric(
         prev.disk_log_pct, curr.disk_log_pct,
-        flag_if=lambda d, _p, _c: d >= DISK_INCREASE_WARN_PP,
+        flag_if=lambda d, _p, _c: d >= profile.delta_disk_increase_pp,
         flag_reason_fn=lambda d, _p, c: f"/var/log disk grew {d} pp (now {c}%)",
         suppress=suppress,
     )
@@ -144,6 +153,7 @@ def compare(prev: RunSnapshot, curr: RunSnapshot) -> DeltaReport:
     # ── Connections (global) ──────────────────────────────────────────
     report.total_conn_current = _compare_conn_relative(
         prev.total_conn_current, curr.total_conn_current,
+        threshold_pct=profile.delta_conn_increase_pct_rel,
         suppress=suppress,
     )
 
@@ -154,7 +164,9 @@ def compare(prev: RunSnapshot, curr: RunSnapshot) -> DeltaReport:
         prev_vs = prev.vsids.get(vsid_str)
         curr_vs = curr.vsids.get(vsid_str)
         report.vsid_deltas[vsid_int] = _compare_vsid(
-            vsid_int, prev_vs, curr_vs, suppress=suppress
+            vsid_int, prev_vs, curr_vs,
+            vsid_conn_warn_pp=profile.delta_vsid_conn_increase_pp,
+            suppress=suppress,
         )
 
     # ── PNOTE set difference ──────────────────────────────────────────
@@ -269,7 +281,9 @@ def _compare_string(
 
 
 def _compare_conn_relative(
-    prev_val: int, curr_val: int, suppress: bool
+    prev_val: int, curr_val: int,
+    threshold_pct: int = CONN_INCREASE_WARN_PCT,
+    suppress: bool = False,
 ) -> DeltaItem:
     """
     Flag if connections increased by >= CONN_INCREASE_WARN_PCT relative %.
@@ -289,8 +303,8 @@ def _compare_conn_relative(
     flagged = (
         not suppress
         and delta > 0
-        and rel_pct >= CONN_INCREASE_WARN_PCT
-        and curr_val > 100          # ignore trivial absolute counts in lab
+        and rel_pct >= threshold_pct
+        and curr_val > 100
     )
     reason = (
         f"connections increased {rel_pct:.0f}% ({prev_val} -> {curr_val})"
@@ -354,9 +368,10 @@ def _compare_member_states(
 
 def _compare_vsid(
     vsid: int,
-    prev_vs,   # VSIDSnapshot or None
-    curr_vs,   # VSIDSnapshot or None
-    suppress: bool,
+    prev_vs,
+    curr_vs,
+    vsid_conn_warn_pp: int = VSID_CONN_WARN_PP,
+    suppress: bool = False,
 ) -> VSIDDelta:
     """Build a VSIDDelta from two optional VSIDSnapshots."""
     name = (curr_vs or prev_vs).name if (curr_vs or prev_vs) else ""
@@ -380,7 +395,7 @@ def _compare_vsid(
         curr_pct = (curr_vs.conn_current / curr_vs.conn_limit) * 100
         vdelta.conn_pct = _compare_numeric_float(
             prev_pct, curr_pct,
-            flag_if=lambda d, _p, _c: d >= VSID_CONN_WARN_PP,
+            flag_if=lambda d, _p, _c: d >= vsid_conn_warn_pp,
             flag_reason_fn=lambda d, _p, c: (
                 f"VSID {vsid} connection usage up {d:.1f} pp (now {c:.1f}%)"
             ),

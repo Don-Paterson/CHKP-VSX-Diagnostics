@@ -27,6 +27,7 @@ import os
 from typing import List, Optional
 
 from models.data import AttentionItem, HealthSummary
+from models.member import MemberComparison
 from models.snapshot import DeltaItem, DeltaReport
 
 log = logging.getLogger(__name__)
@@ -79,6 +80,8 @@ def _build_html(s: HealthSummary, delta: Optional[DeltaReport] = None) -> str:
     sections.append(_health_section(s))
     if delta is not None:
         sections.append(_delta_section(delta))
+    if s.member_comparison is not None:
+        sections.append(_member_comparison_section(s.member_comparison))
     sections.append(_attention_section(s))
     sections.append(_virtual_devices_section(s))
     sections.append(_hcp_section(s))
@@ -133,6 +136,7 @@ def _environment_section(s: HealthSummary) -> str:
         ("Load Average",   p.load_avg or "?"),
         ("Disk /",         p.disk_root_pct or "?"),
         ("Disk /var/log",  p.disk_log_pct or "?"),
+        ("Threshold Profile", s.active_profile),
     ]
     rows_html = "\n".join(
         f"<tr><td class='key'>{e(k)}</td><td>{e(v)}</td></tr>"
@@ -388,6 +392,105 @@ def _raw_detail_section(s: HealthSummary) -> str:
 def e(text: str) -> str:
     """HTML-escape a string."""
     return html_module.escape(str(text))
+
+
+def _member_comparison_section(mc: MemberComparison) -> str:
+    """Render the all-member comparison card."""
+    reachable = [s for s in mc.snapshots if s.reachable]
+    total     = len(mc.snapshots)
+
+    # ── Header line ───────────────────────────────────────────────────
+    meta_parts = [
+        f"<span class='mc-meta-item'>"
+        f"<strong>{len(reachable)}</strong> of <strong>{total}</strong> members reachable"
+        f"</span>"
+    ]
+    if mc.unreachable:
+        meta_parts.append(
+            f"<span class='mc-meta-item mc-warn'>"
+            f"&#9888; Unreachable: {e(', '.join(mc.unreachable))}"
+            f"</span>"
+        )
+    meta_html = "<div class='mc-meta'>" + "".join(meta_parts) + "</div>"
+
+    if len(reachable) < 2:
+        body = (meta_html +
+                "<p class='mc-note'>Fewer than 2 members reachable "
+                "— cross-member comparison skipped.</p>")
+        return _card("All-Member Comparison", body)
+
+    # ── Per-member summary table ───────────────────────────────────────
+    thead = (
+        "<thead><tr>"
+        "<th>Member</th><th>State</th><th>Ver</th><th>JHF</th>"
+        "<th>CPU idle%</th><th>Root%</th><th>Log%</th>"
+        "<th>Sync</th><th>Failovers</th><th>Load Avg</th>"
+        "</tr></thead>"
+    )
+    rows = []
+    for snap in sorted(reachable, key=lambda s: s.name):
+        state_cls = {
+            "ACTIVE":  "state-active",
+            "STANDBY": "state-standby",
+            "BACKUP":  "state-backup",
+            "READY":   "state-ready",
+            "DOWN":    "state-down",
+        }.get(snap.own_state, "")
+        cpu = f"{snap.cpu_idle_pct:.1f}%" if snap.cpu_idle_pct is not None else "n/a"
+        sync_cls = "" if snap.sync_status == "OK" else "mc-warn-cell"
+        rows.append(
+            f"<tr>"
+            f"<td><strong>{e(snap.name)}</strong></td>"
+            f"<td><span class='badge {state_cls}'>{e(snap.own_state or '?')}</span></td>"
+            f"<td>{e(snap.cp_version_short)}</td>"
+            f"<td>{e(snap.jhf_take)}</td>"
+            f"<td>{e(cpu)}</td>"
+            f"<td>{snap.disk_root_pct}%</td>"
+            f"<td>{snap.disk_log_pct}%</td>"
+            f"<td class='{sync_cls}'>{e(snap.sync_status)}</td>"
+            f"<td>{snap.failover_count}</td>"
+            f"<td>{e(snap.load_avg)}</td>"
+            f"</tr>"
+        )
+    summary_table = (
+        f"<table class='mc-table'>{thead}"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+    # ── Differences table ─────────────────────────────────────────────
+    diff_html = ""
+    if mc.diffs:
+        diff_rows = []
+        for diff in mc.diffs:
+            flag_cls = "mc-diff-flagged" if diff.flagged else "mc-diff-info"
+            icon = "&#9888;" if diff.flagged else "&#8505;"
+            vals_html = " &nbsp;|&nbsp; ".join(
+                f"<span class='mc-member-name'>{e(m)}</span>: {e(v)}"
+                for m, v in sorted(diff.member_values.items())
+            )
+            note_html = (
+                f"<br><small class='mc-note-text'>{e(diff.note)}</small>"
+                if diff.note else ""
+            )
+            diff_rows.append(
+                f"<tr class='{flag_cls}'>"
+                f"<td class='mc-diff-icon'>{icon}</td>"
+                f"<td class='mc-diff-metric'>{e(diff.metric)}</td>"
+                f"<td class='mc-diff-vals'>{vals_html}{note_html}</td>"
+                f"</tr>"
+            )
+        diff_html = (
+            "<h4 style='margin:14px 0 6px'>Differences</h4>"
+            "<table class='mc-diff-table'>"
+            "<thead><tr><th></th><th>Metric</th><th>Values</th></tr></thead>"
+            f"<tbody>{''.join(diff_rows)}</tbody>"
+            "</table>"
+        )
+    else:
+        diff_html = "<p class='mc-ok'>&#10003; All members consistent — no differences detected.</p>"
+
+    body = meta_html + summary_table + diff_html
+    return _card("All-Member Comparison", body)
 
 
 def _delta_section(delta: DeltaReport) -> str:
@@ -806,6 +909,40 @@ td.blades {{ font-size: 0.8rem; color: #aaa; }}
   background: #0f1a2e;
   border-radius: 4px;
 }}
+
+/* ---- All-member comparison ---- */
+.mc-meta {{ display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; align-items: center; }}
+.mc-meta-item {{ font-size: 0.85rem; color: #aaa; }}
+.mc-meta-item strong {{ color: #e0e0e0; }}
+.mc-warn {{ color: #ffa726; }}
+.mc-ok {{ color: #4caf84; padding: 6px 0; }}
+.mc-note {{ color: #888; font-size: 0.85rem; padding: 6px 0; }}
+.mc-table {{ width: 100%; border-collapse: collapse; font-size: 0.83rem; margin-bottom: 14px; }}
+.mc-table thead th {{
+  text-align: left; padding: 6px 10px;
+  background: #0f2040; color: #7eb8f7;
+  border-bottom: 1px solid #0f3460;
+}}
+.mc-table td {{ padding: 5px 10px; border-bottom: 1px solid #0f1a2e; }}
+.mc-warn-cell {{ color: #ffa726; font-weight: 600; }}
+.mc-diff-table {{ width: 100%; border-collapse: collapse; font-size: 0.83rem; }}
+.mc-diff-table thead th {{
+  text-align: left; padding: 5px 10px;
+  background: #0a1628; color: #555;
+  font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em;
+  border-bottom: 1px solid #0f1a2e;
+}}
+.mc-diff-table td {{ padding: 5px 10px; border-bottom: 1px solid #0f1a2e; vertical-align: top; }}
+.mc-diff-flagged {{ background: rgba(255,167,38,0.07); }}
+.mc-diff-flagged .mc-diff-icon {{ color: #ffa726; }}
+.mc-diff-flagged .mc-diff-metric {{ color: #ffa726; font-weight: 600; }}
+.mc-diff-info .mc-diff-icon {{ color: #7eb8f7; }}
+.mc-diff-info .mc-diff-metric {{ color: #7eb8f7; }}
+.mc-diff-icon {{ width: 22px; text-align: center; }}
+.mc-diff-metric {{ width: 28%; }}
+.mc-diff-vals {{ color: #ccc; }}
+.mc-member-name {{ color: #7eb8f7; font-weight: 600; }}
+.mc-note-text {{ color: #888; }}
 
 /* ---- Delta comparison ---- */
 .delta-meta {{ margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }}
