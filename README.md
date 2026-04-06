@@ -34,11 +34,12 @@ Log file is written to the same directory as the script.
 Python 3.12 script that connects to the VSX cluster via SSH from the Windows admin
 workstation. No tools need to be installed on the gateway.
 
-Produces three output files on each run:
-- **Console** — executive summary printed to screen
-- **`.log`** — full plain-text diagnostic (all raw command output + summary)
+Produces four output files on each run:
+- **Console** — executive summary printed to screen, with delta banner if a previous run exists
+- **`.log`** — full plain-text diagnostic (all raw command output + summary + delta section)
 - **`.html`** — self-contained dark-theme report with collapsible sections, RAG badges,
-  cluster member state table, per-VSID status, and HCP health check findings
+  cluster member state table, per-VSID status, HCP health check findings, and delta comparison card
+- **`.snapshot.json`** — machine-readable snapshot of key metrics, used for delta comparison on the next run
 
 HCP reports (`hcp -r all`) are automatically downloaded from the gateway via SFTP
 and archived locally per gateway for historical reference.
@@ -64,7 +65,7 @@ across updates.
 # First run — include --fetch to populate NCS topology data (required on R82)
 python C:\vsx_diagnostics\vsx_diagnostics.py --fetch
 
-# Subsequent runs
+# Subsequent runs — delta comparison happens automatically
 python C:\vsx_diagnostics\vsx_diagnostics.py
 
 # Verbose output — shows each collector as it runs
@@ -86,7 +87,7 @@ python C:\vsx_diagnostics\vsx_diagnostics.py --help
 | `--password` | *(prompted)* | SSH password |
 | `--expert-password` | *(same as password)* | Expert mode password if different |
 | `--fetch` | off | Run `vsx fetch` before NCS collection — required on R82 first run |
-| `--output-dir` | `C:\vsx_diagnostics\reports` | Directory for `.log` and `.html` output files |
+| `--output-dir` | `C:\vsx_diagnostics\reports` | Directory for `.log`, `.html`, and `.snapshot.json` output files |
 | `--hcp-archive` | `C:\vsx_diagnostics\hcp_archive` | Directory for HCP tar.gz archives |
 | `--port` | `22` | SSH port |
 | `--timeout` | `15` | SSH connect timeout (seconds) |
@@ -97,12 +98,49 @@ python C:\vsx_diagnostics\vsx_diagnostics.py --help
 ```
 C:\vsx_diagnostics\
 ├── reports\
-│   ├── vsx_diag_<hostname>_<timestamp>.log    # full plain-text diagnostic
-│   └── vsx_diag_<hostname>_<timestamp>.html   # self-contained HTML report
+│   ├── vsx_diag_<hostname>_<timestamp>.log           # full plain-text diagnostic
+│   ├── vsx_diag_<hostname>_<timestamp>.html          # self-contained HTML report
+│   └── vsx_diag_<hostname>_<timestamp>.snapshot.json # metrics snapshot for delta comparison
 └── hcp_archive\
     └── <hostname>\
-        └── hcp_report_<hostname>_<timestamp>.tar.gz   # CP HCP report (extract → index.html)
+        └── hcp_report_<hostname>_<timestamp>.tar.gz  # CP HCP report (extract → index.html)
 ```
+
+---
+
+## Delta comparison
+
+From the second run onward, the tool automatically compares the current run against
+the most recent previous snapshot and highlights any changes.
+
+**What is compared:**
+
+| Category | Metrics |
+|----------|---------|
+| Cluster | Failover count, sync status, sync lost updates, per-member state |
+| Platform | CPU idle %, swap used (MB), root disk %, /var/log disk % |
+| Connections | Total connection count (global), per-VSID connection % of limit |
+| SecureXL | Status per firewall VSID (any change flagged) |
+| Interfaces | Cumulative RX/TX error and drop counters per VSID (increase flagged) |
+| PNOTEs | New, resolved, and status-changed entries in the Problem Notification table |
+| HCP | Tests that moved from PASSED to ERROR/WARNING/INFO, and vice versa |
+
+**Flagging behaviour:**
+
+- Cluster state events (failover, sync loss, member state change) are **always flagged** — never suppressed
+- Resource metrics (CPU, disk, swap, connections) are flagged only when the change exceeds a threshold
+- If two runs are less than 2 minutes apart, resource flags are suppressed (lab re-run noise)
+- Interface error counters that decrease (counter reset) are flagged as a reboot/bounce indicator
+- When the current and previous runs were collected from different cluster members, a provenance note is shown
+
+**Where delta appears:**
+
+- **Console** — compact banner listing any flagged changes, printed before the main summary
+- **Log file** — full delta section injected after the header, showing all changed metrics
+- **HTML report** — "Delta Comparison" card with a colour-coded table (amber = flagged, green = resolved)
+
+The snapshot file is compact ASCII JSON (typically under 5 KB) and contains only the
+metrics needed for comparison — not raw command output.
 
 ---
 
@@ -122,7 +160,9 @@ The Python tool runs the following in order on each execution:
 10. Cluster health (`cphaprob stat/syncstat`, `cpstat ha -f all`)
 11. HCP health check (`hcp -r all` + SFTP download of tar.gz report)
 12. Health assessment — 16 threshold rules applied, ATTENTION items generated
-13. Render: console summary + log file + HTML report
+13. Delta comparison — current run compared against most recent snapshot (if available)
+14. Snapshot saved to `.snapshot.json`
+15. Render: console summary + log file + HTML report
 
 ---
 
@@ -149,7 +189,9 @@ python/
 ├── requirements.txt              # paramiko==3.5.1
 ├── vsx_diagnostics.py            # Entry point / CLI
 └── vsx_diagnostics_py/
-    ├── models/data.py            # All dataclasses (ClusterTopology, VSIDInfo, HealthSummary ...)
+    ├── models/
+    │   ├── data.py               # All dataclasses (ClusterTopology, VSIDInfo, HealthSummary ...)
+    │   └── snapshot.py           # RunSnapshot, DeltaItem, VSIDDelta, DeltaReport
     ├── transport/ssh.py          # Paramiko SSH — ExpertSession, connect_to_cluster(), SFTP
     ├── collectors/               # One module per data collection area
     │   ├── topology.py           # Preflight + local.vsall
@@ -169,16 +211,19 @@ python/
     │   ├── affinity.py
     │   ├── securexl.py
     │   └── iface_errors.py
+    ├── delta/                    # Delta comparison (no SSH, no rendering)
+    │   ├── comparator.py         # Pure compare(prev, curr) → DeltaReport
+    │   └── serialiser.py         # snapshot_from_summary(), save_snapshot(), load_prev_snapshot()
     ├── health/assessor.py        # 16 threshold rules → AttentionItem list
     └── renderers/
-        ├── text_builder.py       # Shared text output engine
-        ├── console.py            # stdout executive summary
-        ├── logfile.py            # Full plain-text log
-        └── html.py               # Self-contained HTML report
+        ├── text_builder.py       # Shared text output engine (summary + delta sections)
+        ├── console.py            # stdout executive summary + delta banner
+        ├── logfile.py            # Full plain-text log + delta section
+        └── html.py               # Self-contained HTML report + delta comparison card
 ```
 
-Parsers are pure functions (no SSH calls) making them independently testable
-against captured gateway output without needing a live cluster.
+Parsers and the delta comparator are pure functions (no SSH calls) making them
+independently testable against captured gateway output without needing a live cluster.
 
 ---
 
@@ -196,6 +241,7 @@ These lessons from v18 bash development are encoded in the Python tool:
 - SecureXL status: R82 KPPAK pipe-table format — status is field index 3 after pipe-split
 - `hcp -r all` output contains ANSI colour codes and `\r` Working lines — stripped before parsing
 - Hyper-V LACP bond sync warnings are expected noise — downgraded from WARNING to INFO automatically
+- Interface error counters are cumulative — delta comparison flags increases, and flags decreases as counter resets
 
 ---
 
