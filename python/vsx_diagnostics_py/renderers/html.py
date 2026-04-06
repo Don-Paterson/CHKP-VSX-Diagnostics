@@ -218,6 +218,19 @@ def _health_section(s: HealthSummary) -> str:
         row("CPU Idle",
             f"{diag0.cpu_idle_pct:.1f}%" if diag0 and diag0.cpu_idle_pct is not None else "?",
             "warn" if diag0 and diag0.cpu_idle_pct is not None and diag0.cpu_idle_pct < 50 else "ok"),
+    ]
+
+    # CPView historical averages — append if available
+    p = s.platform
+    if p.cpview_available:
+        cpv_5m  = f"{p.cpview_cpu_5m_idle:.1f}%"  if p.cpview_cpu_5m_idle  is not None else "n/a"
+        cpv_15m = f"{p.cpview_cpu_15m_idle:.1f}%"  if p.cpview_cpu_15m_idle is not None else "n/a"
+        cpv_1h  = f"{p.cpview_cpu_1h_idle:.1f}%"   if p.cpview_cpu_1h_idle  is not None else "n/a"
+        rows.append(row("CPU 5m avg (CPView)",  cpv_5m))
+        rows.append(row("CPU 15m avg (CPView)", cpv_15m))
+        rows.append(row("CPU 1h avg (CPView)",  cpv_1h))
+
+    rows += [
         row("Memory (VS0)",
             f"{diag0.mem_used_pct} ({diag0.mem_used_mb}/{diag0.mem_total_mb} MB)" if diag0 else "?"),
         row("Swap (VS0)",

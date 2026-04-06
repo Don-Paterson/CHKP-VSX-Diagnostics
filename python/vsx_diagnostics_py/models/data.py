@@ -283,6 +283,13 @@ class PlatformInfo:
     cplic_raw: str = ""             # cplic print (first 20 lines)
     cpinfo_raw: str = ""            # cpinfo -y all
 
+    # CPView historical CPU data (VS0 / gateway-wide)
+    cpview_available: bool = False          # False if cpview not present or failed
+    cpview_cpu_5m_idle: Optional[float] = None   # 5-minute average CPU idle %
+    cpview_cpu_15m_idle: Optional[float] = None  # 15-minute average CPU idle %
+    cpview_cpu_1h_idle: Optional[float] = None   # 1-hour average CPU idle % (if available)
+    cpview_raw: str = ""                    # raw cpview output for log
+
 
 
 # ---------------------------------------------------------------------------

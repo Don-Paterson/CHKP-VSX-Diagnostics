@@ -155,6 +155,10 @@ def _build_export(
         "cpu_idle_pct":     diag0.cpu_idle_pct if diag0 else None,
         "swap_used_mb":     diag0.swap_used_mb if diag0 else None,
         "corexl_instances": diag0.corexl_instances if diag0 else None,
+        "cpview_available":    s.platform.cpview_available,
+        "cpview_cpu_5m_idle":  s.platform.cpview_cpu_5m_idle,
+        "cpview_cpu_15m_idle": s.platform.cpview_cpu_15m_idle,
+        "cpview_cpu_1h_idle":  s.platform.cpview_cpu_1h_idle,
     }
 
     # ── Cluster ───────────────────────────────────────────────────────

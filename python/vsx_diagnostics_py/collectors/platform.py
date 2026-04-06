@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 import logging
 
+from collectors.cpview import collect_cpview
 from models.data import PlatformInfo
 from transport.ssh import ExpertSession
 
@@ -109,6 +110,21 @@ def collect_platform(
     log.info("Platform: collecting license info ...")
     raw_cplic = session.run("cplic print 2>&1 | head -20")
     info.cplic_raw = raw_cplic
+
+    # ----------------------------------------------------------------
+    # CPView historical CPU data
+    # ----------------------------------------------------------------
+    log.info("Platform: collecting CPView historical CPU data ...")
+    collect_cpview(session, info)
+    if info.cpview_available:
+        log.info(
+            "Platform: CPView 5m=%.1f%% 15m=%s 1h=%s",
+            info.cpview_cpu_5m_idle or 0,
+            f"{info.cpview_cpu_15m_idle:.1f}%" if info.cpview_cpu_15m_idle is not None else "n/a",
+            f"{info.cpview_cpu_1h_idle:.1f}%" if info.cpview_cpu_1h_idle is not None else "n/a",
+        )
+    else:
+        log.info("Platform: CPView not available")
 
     log.info("Platform: collection complete")
     return info

@@ -366,7 +366,20 @@ def _health_section(s: HealthSummary) -> List[str]:
     idle  = f"{diag0.cpu_idle_pct:.1f}%" if diag0 and diag0.cpu_idle_pct is not None else "?"
     load  = s.platform.load_avg or "?"
     cores = diag0.corexl_instances if diag0 else "?"
-    cpu_line = f"  CPU            : {idle} idle, load avg {load}, {cores} CoreXL instances"
+
+    # Append CPView historical averages if available
+    p = s.platform
+    if p.cpview_available:
+        cpv_5m  = f"{p.cpview_cpu_5m_idle:.1f}%"  if p.cpview_cpu_5m_idle  is not None else "n/a"
+        cpv_15m = f"{p.cpview_cpu_15m_idle:.1f}%" if p.cpview_cpu_15m_idle is not None else "n/a"
+        cpv_1h  = f"{p.cpview_cpu_1h_idle:.1f}%"  if p.cpview_cpu_1h_idle  is not None else "n/a"
+        cpu_line = (
+            f"  CPU            : {idle} idle (now), "
+            f"CPView avg: 5m={cpv_5m} 15m={cpv_15m} 1h={cpv_1h}, "
+            f"load avg {load}, {cores} CoreXL instances"
+        )
+    else:
+        cpu_line = f"  CPU            : {idle} idle, load avg {load}, {cores} CoreXL instances"
 
     if diag0:
         mem_line = (
