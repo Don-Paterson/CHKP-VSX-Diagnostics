@@ -1,11 +1,15 @@
 # install.ps1
 # Deploy vsx_diagnostics Python tool to C:\vsx_diagnostics on A-GUI
 # Usage: irm https://raw.githubusercontent.com/Don-Paterson/CHKP-VSX-Diagnostics/main/python/install.ps1 | iex
+#
+# Self-bootstrapping: if no Python interpreter is found, installs Python 3.12
+# via winget (with a direct-download fallback), then re-resolves and proceeds.
 
-$dest     = "C:\vsx_diagnostics"
-$zip      = "$env:TEMP\vsx_diag.zip"
-$extract  = "$env:TEMP\vsx_diag_extract"
-$src      = "$extract\CHKP-VSX-Diagnostics-main\python"
+$dest        = "C:\vsx_diagnostics"
+$zip         = "$env:TEMP\vsx_diag.zip"
+$extract     = "$env:TEMP\vsx_diag_extract"
+$src         = "$extract\CHKP-VSX-Diagnostics-main\python"
+$pyVersion   = "3.12.7"   # version used for the direct-download fallback
 
 # -----------------------------------------------------------------------
 # Resolve a working Python launcher.
@@ -33,6 +37,68 @@ function Resolve-Python {
         }
     }
     return $null
+}
+
+# -----------------------------------------------------------------------
+# Refresh PATH in the current session from the machine + user registry.
+# A freshly installed Python prepends itself to PATH, but that change is
+# not visible to this already-running process until we re-read it.
+# -----------------------------------------------------------------------
+function Update-SessionPath {
+    $machine = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $user    = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ";"
+}
+
+# -----------------------------------------------------------------------
+# Install Python when none is present.
+# Strategy: winget first (App Installer), direct python.org installer as
+# fallback. Both put python on PATH (winget package does so by default;
+# the .exe is run with PrependPath=1). Returns $true on a usable install.
+# -----------------------------------------------------------------------
+function Install-Python {
+    # --- Attempt 1: winget ------------------------------------------------
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host "        Installing Python $pyVersion via winget..." -ForegroundColor Yellow
+        # --source winget bypasses the Skillable HTTPS-Inspection MITM that
+        # breaks the default 'msstore' source on A-GUI lab images.
+        & winget install --id Python.Python.3.12 -e --source winget `
+            --accept-package-agreements --accept-source-agreements --silent 2>&1 | Out-Null
+
+        Update-SessionPath
+        if (Resolve-Python) { return $true }
+        Write-Host "        winget install did not yield a usable interpreter - trying direct download." -ForegroundColor Yellow
+    } else {
+        Write-Host "        winget not available - using direct download." -ForegroundColor Yellow
+    }
+
+    # --- Attempt 2: direct python.org installer ---------------------------
+    $url = "https://www.python.org/ftp/python/$pyVersion/python-$pyVersion-amd64.exe"
+    $out = "$env:TEMP\python-$pyVersion-amd64.exe"
+    Write-Host "        Downloading $url ..." -ForegroundColor Yellow
+    try {
+        Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+    } catch {
+        Write-Host "        Download failed: $_" -ForegroundColor Red
+        return $false
+    }
+
+    Write-Host "        Running silent installer (PrependPath=1, Include_pip=1)..." -ForegroundColor Yellow
+    # InstallAllUsers=1 needs elevation; default per-user install avoids that
+    # and still prepends PATH, which is all Resolve-Python needs.
+    $p = Start-Process -FilePath $out `
+        -ArgumentList "/quiet PrependPath=1 Include_pip=1 Include_launcher=1" `
+        -Wait -PassThru
+    Remove-Item $out -Force -ErrorAction SilentlyContinue
+
+    if ($p.ExitCode -ne 0) {
+        Write-Host "        Installer exited with code $($p.ExitCode)." -ForegroundColor Red
+        return $false
+    }
+
+    Update-SessionPath
+    return [bool](Resolve-Python)
 }
 
 # -----------------------------------------------------------------------
@@ -76,9 +142,18 @@ Remove-Item $extract -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "        Done." -ForegroundColor Green
 
 # -----------------------------------------------------------------------
-# Resolve interpreter once - used by Steps 3 and 4
+# Resolve interpreter - bootstrap Python if missing
 # -----------------------------------------------------------------------
 $py = Resolve-Python
+if (-not $py) {
+    Write-Host "Step 2b: No Python found - bootstrapping..." -ForegroundColor Yellow
+    if (Install-Python) {
+        $py = Resolve-Python
+        Write-Host "        Python installed." -ForegroundColor Green
+    } else {
+        Write-Host "        Automatic install failed - install Python manually and re-run." -ForegroundColor Red
+    }
+}
 if ($py) {
     $pyDisplay = (@($py.Exe) + $py.Args) -join " "
     Write-Host "        Using Python: $pyDisplay (v$($py.Version))" -ForegroundColor Green
@@ -90,7 +165,7 @@ if ($py) {
 Write-Host "Step 3: Installing paramiko..." -ForegroundColor Yellow
 
 if (-not $py) {
-    Write-Host "        No Python interpreter found (tried python, py -3, python3)." -ForegroundColor Red
+    Write-Host "        Skipped - no Python interpreter available." -ForegroundColor Red
     Write-Host "        Install Python (tick 'Add to PATH'), then run manually:" -ForegroundColor Yellow
     Write-Host "          winget install --id Python.Python.3.12 -e --source winget" -ForegroundColor Yellow
     Write-Host "          py -m pip install paramiko==3.5.1" -ForegroundColor Yellow
@@ -145,6 +220,13 @@ Write-Host ""
 Write-Host "Deployed to  : $dest"
 Write-Host "Reports      : $dest\reports"
 Write-Host "HCP archives : $dest\hcp_archive"
+
+if (-not $py) {
+    Write-Host ""
+    Write-Host "NOTE: Python was not available and could not be auto-installed." -ForegroundColor Yellow
+    Write-Host "      Open a NEW PowerShell window after installing Python, then re-run." -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "Usage:" -ForegroundColor Cyan
 Write-Host "  # First run (recommended - fetches NCS topology data):"
