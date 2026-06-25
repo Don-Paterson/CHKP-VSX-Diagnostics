@@ -7,7 +7,7 @@ Two tools, same job — choose based on where you're running from.
 
 ## Tools
 
-### `bash/vsx_diagnostics.sh` — Run on the gateway (v18)
+### `bash/vsx_diagnostics.sh` — Run on the gateway
 
 Bash script that runs directly on the VSX gateway in Expert mode (VS0 context).  
 No external dependencies — uses only standard Gaia CLI tools.
